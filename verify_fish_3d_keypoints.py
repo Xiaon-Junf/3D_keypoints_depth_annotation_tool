@@ -1247,20 +1247,54 @@ class Fish3DKeypointVerifier:
             # 创建和添加点云
             if self.point_cloud_data is not None:
                 # 创建全局点云（0-10米范围）
+                global_mask = (self.point_cloud_data[:, 2] >= -10000) & (self.point_cloud_data[:, 2] <= 0)
+                global_points = self.point_cloud_data[global_mask]
+
                 global_pcd = o3d.geometry.PointCloud()
-                global_pcd.points = o3d.utility.Vector3dVector(self.point_cloud_data)
-                global_pcd.colors = o3d.utility.Vector3dVector(self.color_rectify_data.reshape(-1, 3) / 255.0)
+                global_pcd.points = o3d.utility.Vector3dVector(global_points)
+
+                # 为全局点云着色
+                if self.color_rectify_data is not None:
+                    height, width = self.color_rectify_data.shape[:2]
+                    global_colors = []
+                    for point in global_points:
+                        x, y, z = int(round(point[0])), int(round(point[1])), point[2]
+                        # 由于点云x坐标被翻转，在获取图像颜色时需要翻转回原始坐标
+                        x_original = width - 1 - x
+                        if 0 <= x_original < width and 0 <= y < height:
+                            color = self.color_rectify_data[y, x_original] / 255.0
+                            global_colors.append(color)
+                        else:
+                            global_colors.append([0.5, 0.5, 0.5])  # 默认灰色
+                    global_colors = np.array(global_colors)
+                    global_pcd.colors = o3d.utility.Vector3dVector(global_colors)
+                else:
+                    # 如果没有颜色数据，使用默认颜色
+                    default_colors = np.full((len(global_points), 3), [0.5, 0.5, 0.5])
+                    global_pcd.colors = o3d.utility.Vector3dVector(default_colors)
+
                 global_vis.add_geometry(global_pcd)
 
                 # 创建局部点云（过滤范围）
-                local_points = self.point_cloud_data[
-                    (self.point_cloud_data[:, 2] >= self.z_min) &
-                    (self.point_cloud_data[:, 2] <= self.z_max)
-                ]
-                local_colors = self.color_rectify_data[
-                    (self.point_cloud_data[:, 2] >= self.z_min) &
-                    (self.point_cloud_data[:, 2] <= self.z_max)
-                ].reshape(-1, 3) / 255.0
+                mask = (self.point_cloud_data[:, 2] >= self.z_min) & (self.point_cloud_data[:, 2] <= self.z_max)
+                local_points = self.point_cloud_data[mask]
+
+                # 从过滤后的点云坐标提取颜色
+                if self.color_rectify_data is not None and len(local_points) > 0:
+                    height, width = self.color_rectify_data.shape[:2]
+                    local_colors = []
+                    for point in local_points:
+                        x, y, z = int(round(point[0])), int(round(point[1])), point[2]
+                        # 由于点云x坐标被翻转，在获取图像颜色时需要翻转回原始坐标
+                        x_original = width - 1 - x
+                        if 0 <= x_original < width and 0 <= y < height:
+                            color = self.color_rectify_data[y, x_original] / 255.0
+                            local_colors.append(color)
+                        else:
+                            local_colors.append([0.5, 0.5, 0.5])  # 默认灰色
+                    local_colors = np.array(local_colors)
+                else:
+                    local_colors = np.full((len(local_points), 3), [0.5, 0.5, 0.5])
 
                 if len(local_points) > 0:
                     local_pcd = o3d.geometry.PointCloud()
