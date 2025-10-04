@@ -44,10 +44,12 @@ from matplotlib.widgets import Button, Slider
 import warnings
 warnings.filterwarnings("ignore")
 
-# 多进程通信
+# 多进程和状态同步
 import multiprocessing as mp
 import threading
 import time
+import subprocess
+import signal
 
 # 添加项目路径到系统路径
 lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
@@ -103,6 +105,7 @@ class Fish3DKeypointVerifier:
 
         # 初始化关键点数据（将在加载帧时动态加载）
         self.fish_keypoints = {}
+        self.fish_bbox = {}  # 新增：存储每条鱼的bbox
         self.fish_names = []
         self.current_fish_idx = -1
         self.keypoints = {}
@@ -128,23 +131,28 @@ class Fish3DKeypointVerifier:
         self.global_vis_window = None
         self.global_keypoint_meshes = {}
 
-        # GUI子进程通信
+        # 独立GUI进程管理
         self.gui_process = None
-        self.gui_pipe = None
+        self.state_file_path = None
+        self.state_update_thread = None
+        self.state_update_running = False
 
         # 点云数据相关
         self.point_cloud_data = None
         self.point_cloud_filtered = None
         self.z_min = 0
         self.z_max = 10000
-        
+
         # 图像数据
         self.image_data = None
         self.color_rectify_data = None  # 用于点云着色的彩色图像
-        
+
+        # 创建状态文件
+        self._create_state_file()
+
         # 立即创建图形界面
         self._create_figure()
-        
+
         # 加载第一帧数据
         if self.frames:
             self._load_current_frame()
@@ -165,25 +173,39 @@ class Fish3DKeypointVerifier:
         
     def _parse_keypoints_by_group_id(self):
         """
-        按照group_id分配逻辑解析关键点
+        按照group_id分配逻辑解析关键点和bbox
         group_id: 0 表示一条新的鱼
         group_id: null 表示属于当前鱼的关键点
         """
         fish_keypoints = {}
+        fish_bbox = {}  # 新增：存储每条鱼的bbox
         current_fish_id = None
         fish_count = 0
-        
+
         # 首先按顺序处理所有形状
         for shape in self.annotation_data['shapes']:
             group_id = shape.get('group_id')
-            
+
             # 如果是矩形且group_id为0，表示一条新的鱼
             if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish' and group_id == 0:
                 fish_count += 1
                 current_fish_id = f"fish_{fish_count}"
                 fish_keypoints[current_fish_id] = {}
-                print(f"找到新的鱼: {current_fish_id}")
-            
+
+                # 解析bbox坐标 - LabelMe格式的矩形用两个点表示左上角和右下角
+                if len(shape['points']) == 2:
+                    x1, y1 = shape['points'][0]
+                    x2, y2 = shape['points'][1]
+                    # 确保x1,y1是左上角，x2,y2是右下角
+                    bbox_x1 = min(x1, x2)
+                    bbox_y1 = min(y1, y2)
+                    bbox_x2 = max(x1, x2)
+                    bbox_y2 = max(y1, y2)
+                    fish_bbox[current_fish_id] = [bbox_x1, bbox_y1, bbox_x2, bbox_y2]
+                    print(f"找到新的鱼: {current_fish_id}, bbox: [{bbox_x1:.1f}, {bbox_y1:.1f}, {bbox_x2:.1f}, {bbox_y2:.1f}]")
+                else:
+                    print(f"找到新的鱼: {current_fish_id}, 但bbox格式不正确")
+
             # 如果是关键点且group_id为null，分配给当前鱼
             elif shape['shape_type'] == 'point' and group_id is None:
                 if current_fish_id is not None:
@@ -194,25 +216,27 @@ class Fish3DKeypointVerifier:
                     print(f"将关键点 '{shape['label']}' 分配给 {current_fish_id}")
                 else:
                     print(f"警告: 关键点 '{shape['label']}' 没有对应的鱼，将被忽略")
-            
+
             # 其他情况（如group_id不为0或null的矩形）
             else:
                 print(f"忽略形状: {shape['label']} (类型: {shape['shape_type']}, group_id: {group_id})")
-        
+
         # 验证分配结果
         if fish_keypoints:
             print(f"成功解析 {len(fish_keypoints)} 条鱼的关键点:")
             for fish_name, kps in fish_keypoints.items():
-                print(f"  {fish_name}: {len(kps)} 个关键点 - {list(kps.keys())}")
+                bbox_info = f", bbox: {fish_bbox.get(fish_name, '无')}" if fish_name in fish_bbox else ""
+                print(f"  {fish_name}: {len(kps)} 个关键点 - {list(kps.keys())}{bbox_info}")
         else:
             print("警告: 没有找到任何鱼的关键点")
-        
+
         # 初始化所有鱼类的关键点深度值
         for fish_name, keypoints in fish_keypoints.items():
             for kp_name, kp_coords in keypoints.items():
                 keypoints[kp_name] = np.array([kp_coords[0], kp_coords[1], 0.0], dtype=np.float32)
-        
-        return fish_keypoints
+
+        # 返回关键点和bbox信息
+        return fish_keypoints, fish_bbox
 
     def _get_frames(self):
         """
@@ -313,8 +337,8 @@ class Fish3DKeypointVerifier:
                 print(f"成功加载标注文件: {annotation_file_path}")
                 print(f"标注文件包含 {len(self.annotation_data['shapes'])} 个形状")
 
-                # 解析关键点，按鱼类分组
-                self.fish_keypoints = self._parse_keypoints_by_group_id()
+                # 解析关键点和bbox，按鱼类分组
+                self.fish_keypoints, self.fish_bbox = self._parse_keypoints_by_group_id()
                 self.fish_names = list(self.fish_keypoints.keys())
                 self.current_fish_idx = 0 if self.fish_names else -1
 
@@ -334,8 +358,8 @@ class Fish3DKeypointVerifier:
                     with open(self.annotation_file, 'r', encoding='utf-8') as f:
                         self.annotation_data = json.load(f)
                     print(f"使用默认标注文件: {self.annotation_file}")
-                    # 解析关键点
-                    self.fish_keypoints = self._parse_keypoints_by_group_id()
+                    # 解析关键点和bbox
+                    self.fish_keypoints, self.fish_bbox = self._parse_keypoints_by_group_id()
                     self.fish_names = list(self.fish_keypoints.keys())
                     self.current_fish_idx = 0 if self.fish_names else -1
                     if self.fish_names:
@@ -452,29 +476,70 @@ class Fish3DKeypointVerifier:
     
     def _filter_point_cloud(self):
         """
-        根据当前关键点的深度范围过滤点云数据
+        根据当前鱼类的bbox和关键点深度范围过滤点云数据
+        实现原来的设计逻辑：从bbox确定深度范围，只加载该区间正负50深度的点云
         """
         if self.point_cloud_data is None:
             self.point_cloud_filtered = None
             return
-        
-        # 计算当前关键点的深度范围
-        valid_depths = [kp[2] for kp in self.keypoints.values() if kp[2] > 0]
-        if valid_depths:
-            # 由于点云z坐标被翻转为负数，需要相应调整过滤范围
-            depth_min = max(0, min(valid_depths) - 50)  # 最小深度设为0mm
-            depth_max = min(10000, max(valid_depths) + 50)  # 最大深度设为10000mm
-            self.z_min = -depth_max  # 转换为负数范围
-            self.z_max = -depth_min  # 转换为负数范围
+
+        # 获取当前鱼类的bbox
+        current_fish_name = self.fish_names[self.current_fish_idx] if self.fish_names and self.current_fish_idx >= 0 else None
+        current_bbox = self.fish_bbox.get(current_fish_name) if current_fish_name else None
+
+        if current_bbox:
+            # 从bbox区域读取深度值来确定深度范围
+            bbox_x1, bbox_y1, bbox_x2, bbox_y2 = current_bbox
+            height, width = self.depth_data.shape
+
+            # 确保bbox坐标在图像范围内
+            bbox_x1 = max(0, int(bbox_x1))
+            bbox_y1 = max(0, int(bbox_y1))
+            bbox_x2 = min(width, int(bbox_x2))
+            bbox_y2 = min(height, int(bbox_y2))
+
+            # 从bbox区域提取深度值
+            bbox_depths = self.depth_data[bbox_y1:bbox_y2, bbox_x1:bbox_x2]
+            valid_bbox_depths = bbox_depths[(bbox_depths > 0) & (bbox_depths < 10000)]
+
+            if len(valid_bbox_depths) > 0:
+                # 根据bbox区域的深度范围确定点云加载范围
+                bbox_depth_min = np.min(valid_bbox_depths)
+                bbox_depth_max = np.max(valid_bbox_depths)
+
+                # 扩展范围：正负50mm
+                depth_min = max(0, bbox_depth_min - 50)
+                depth_max = min(10000, bbox_depth_max + 50)
+
+                # 转换为点云坐标系（z轴翻转）
+                self.z_min = -depth_max
+                self.z_max = -depth_min
+
+                print(f"根据bbox [{bbox_x1}, {bbox_y1}, {bbox_x2}, {bbox_y2}] 确定深度范围: bbox深度 [{bbox_depth_min:.1f}, {bbox_depth_max:.1f}] -> 加载范围 [{depth_min:.1f}, {depth_max:.1f}]")
+            else:
+                # bbox区域没有有效深度，使用默认范围
+                self.z_min = -10000
+                self.z_max = 0
+                print("bbox区域没有有效深度，使用默认范围 [-10000, 0]")
         else:
-            self.z_min = -10000  # 负数深度范围
-            self.z_max = 0
-        
+            # 没有bbox信息，回退到原来的关键点深度范围逻辑
+            print("没有bbox信息，使用关键点深度范围确定点云加载范围")
+            valid_depths = [kp[2] for kp in self.keypoints.values() if kp[2] > 0]
+            if valid_depths:
+                # 由于点云z坐标被翻转为负数，需要相应调整过滤范围
+                depth_min = max(0, min(valid_depths) - 50)  # 最小深度设为0mm
+                depth_max = min(10000, max(valid_depths) + 50)  # 最大深度设为10000mm
+                self.z_min = -depth_max  # 转换为负数范围
+                self.z_max = -depth_min  # 转换为负数范围
+            else:
+                self.z_min = -10000  # 负数深度范围
+                self.z_max = 0
+
         # 根据深度范围过滤点云（现在z坐标是负数）
         z_coords = self.point_cloud_data[:, 2]
         mask = (z_coords >= self.z_min) & (z_coords <= self.z_max)
         self.point_cloud_filtered = self.point_cloud_data[mask]
-        print(f"过滤点云数据，保留深度范围 [{self.z_min}, {self.z_max}] 内的 {len(self.point_cloud_filtered)} 个点")
+        print(f"过滤点云数据，保留深度范围 [{self.z_min:.1f}, {self.z_max:.1f}] 内的 {len(self.point_cloud_filtered)} 个点")
     
     def _update_keypoint_depths(self):
         """
@@ -816,7 +881,7 @@ class Fish3DKeypointVerifier:
             elif name == 'global_3d':
                 btn.on_clicked(self.visualize_global_3d)
             elif name == 'gui_3d':
-                btn.on_clicked(self.start_gui_3d_windows)
+                btn.on_clicked(self.start_standalone_gui)
         
         # 创建深度调整滑块
         ax_depth = plt.axes([0.2, 0.12, 0.6, 0.03])
@@ -1345,77 +1410,21 @@ class Fish3DKeypointVerifier:
             import traceback
             traceback.print_exc()
 
-    def start_gui_3d_windows(self, event=None):
+    def start_standalone_gui(self, event=None):
         """
-        启动GUI 3D窗口子进程
+        启动独立的GUI进程（通过状态文件通信）
         """
-        import platform
+        if self.gui_process is not None:
+            # 检查进程是否还在运行
+            if self.gui_process.poll() is None:
+                print("独立GUI进程已在运行")
+                return
+            else:
+                print("之前的GUI进程已退出，清理...")
+                self.gui_process = None
 
-        if self.gui_process is not None and self.gui_process.is_alive():
-            print("GUI 3D窗口已在运行")
-            return
-
-        # Windows兼容性处理
-        if platform.system() == 'Windows':
-            print("检测到Windows系统，使用兼容模式启动GUI...")
-            self._run_gui_in_main_process()
-            return
-
-        try:
-            # 设置进程启动方式（Linux/macOS使用fork）
-            mp.set_start_method('fork', force=True)
-
-            # 创建通信管道
-            parent_conn, child_conn = mp.Pipe()
-            self.gui_pipe = parent_conn
-
-            # 准备子进程参数
-            gui_args = {
-                'depth_file_path': os.path.join(self.depth_root, "left_disp_0.npy"),
-                'image_path': "fish_dataset/images/0001751539512357.png",
-                'camera_config': self.camera_config,
-                'pipe_conn': child_conn,
-                'depth_data': self.depth_data,
-                'color_rectify_data': self.color_rectify_data,
-                'keypoints': self.keypoints,
-                'keypoint_names': self.keypoint_names,
-                'point_cloud_data': self.point_cloud_data,
-                'z_min': self.z_min,
-                'z_max': self.z_max
-            }
-
-            # 启动子进程
-            self.gui_process = mp.Process(
-                target=run_gui_visualization_worker,
-                args=(gui_args,)
-            )
-            self.gui_process.start()
-
-            print("GUI 3D窗口子进程已启动")
-
-            # 等待子进程完全初始化
-            time.sleep(1.0)  # 增加等待时间
-            print("等待子进程初始化完成...")
-
-            # 发送初始化完成信号
-            if self.gui_pipe is not None:
-                try:
-                    self.gui_pipe.send({'type': 'init_complete'})
-                    print("已发送初始化完成信号到GUI子进程")
-                except Exception as e:
-                    print(f"发送初始化信号失败: {e}")
-
-            # 等待子进程响应
-            time.sleep(0.5)
-
-            # 发送当前状态
-            self._send_gui_fish_update()
-            print("已发送初始状态到GUI子进程")
-
-        except Exception as e:
-            print(f"启动GUI 3D窗口失败: {e}")
-            self.gui_process = None
-            self.gui_pipe = None
+        print("启动独立的3D可视化GUI进程...")
+        self._start_standalone_gui()
 
     def _send_gui_update(self):
         """
@@ -1568,44 +1577,210 @@ class Fish3DKeypointVerifier:
         运行交互式验证工具
         """
         print("启动交互式验证工具")
-        
+
+        # 启动状态更新线程
+        self._start_state_update_thread()
+
         # 初始显示
         self.update_display()
-        
+
         # 显示图形界面
         try:
             plt.show(block=True)
         except Exception as e:
             print(f"显示图形界面失败: {e}")
         finally:
-            # 清理GUI子进程
+            # 停止状态更新线程
+            self._stop_state_update_thread()
+            # 清理GUI进程
             self._cleanup_gui_process()
+
+    def _create_state_file(self):
+        """
+        创建状态文件用于与独立GUI进程通信
+        """
+        try:
+            # 创建临时目录（如果不存在）
+            temp_dir = os.path.join(tempfile.gettempdir(), 'fish_keypoints_gui')
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # 创建状态文件路径
+            self.state_file_path = os.path.join(temp_dir, 'keypoints_state.json')
+
+            # 写入初始状态
+            initial_state = {
+                'timestamp': time.time(),
+                'current_frame': self.frames[0] if self.frames else '',
+                'current_fish_idx': -1,
+                'current_kp_idx': -1,
+                'fish_keypoints': {},
+                'point_cloud_range': {
+                    'z_min': 0.0,
+                    'z_max': 10000.0
+                }
+            }
+
+            with open(self.state_file_path, 'w', encoding='utf-8') as f:
+                json.dump(initial_state, f, indent=2)
+
+            print(f"状态文件已创建: {self.state_file_path}")
+
+        except Exception as e:
+            print(f"创建状态文件失败: {e}")
+            self.state_file_path = None
+
+    def _update_state_file(self):
+        """
+        更新状态文件
+        """
+        if not self.state_file_path:
+            return
+
+        try:
+            # 构建当前状态
+            current_state = {
+                'timestamp': time.time(),
+                'current_frame': self.frames[self.current_frame_idx] if self.frames else '',
+                'current_fish_idx': self.current_fish_idx,
+                'current_kp_idx': self.current_kp_idx,
+                'fish_keypoints': {},
+                'fish_bbox': {},  # 新增：bbox信息
+                'point_cloud_range': {
+                    'z_min': float(self.z_min),
+                    'z_max': float(self.z_max)
+                }
+            }
+
+            # 添加所有鱼类的关键点数据和bbox数据
+            for fish_name, keypoints in self.fish_keypoints.items():
+                current_state['fish_keypoints'][fish_name] = {}
+                for kp_name, kp_coords in keypoints.items():
+                    current_state['fish_keypoints'][fish_name][kp_name] = [
+                        float(kp_coords[0]),
+                        float(kp_coords[1]),
+                        float(kp_coords[2])
+                    ]
+
+                # 添加bbox数据
+                if fish_name in self.fish_bbox:
+                    current_state['fish_bbox'][fish_name] = [float(x) for x in self.fish_bbox[fish_name]]
+
+            # 写入状态文件
+            with open(self.state_file_path, 'w', encoding='utf-8') as f:
+                json.dump(current_state, f, indent=2)
+
+        except Exception as e:
+            print(f"更新状态文件失败: {e}")
+
+    def _start_state_update_thread(self):
+        """
+        启动状态更新线程
+        """
+        if self.state_update_thread is not None and self.state_update_thread.is_alive():
+            return
+
+        self.state_update_running = True
+        self.state_update_thread = threading.Thread(target=self._state_update_loop, daemon=True)
+        self.state_update_thread.start()
+        print("状态更新线程已启动")
+
+    def _state_update_loop(self):
+        """
+        状态更新循环，每100ms更新一次状态文件
+        """
+        while self.state_update_running:
+            self._update_state_file()
+            time.sleep(0.1)  # 100ms更新一次
+
+    def _stop_state_update_thread(self):
+        """
+        停止状态更新线程
+        """
+        self.state_update_running = False
+        if self.state_update_thread and self.state_update_thread.is_alive():
+            self.state_update_thread.join(timeout=1.0)
+            print("状态更新线程已停止")
+
+    def _start_standalone_gui(self):
+        """
+        启动独立的GUI进程
+        """
+        if self.gui_process is not None:
+            print("GUI进程已在运行")
+            return
+
+        try:
+            # 检查standalone_gui.py是否存在
+            gui_script_path = os.path.join(os.path.dirname(__file__), 'standalone_gui.py')
+            if not os.path.exists(gui_script_path):
+                print(f"GUI脚本不存在: {gui_script_path}")
+                return
+
+            # 构建命令行参数
+            cmd = [
+                sys.executable,  # Python解释器
+                gui_script_path,
+                '--state-file', self.state_file_path,
+                '--camera-config', self.camera_config
+            ]
+
+            print(f"启动GUI进程: {' '.join(cmd)}")
+
+            # 启动GUI进程
+            self.gui_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            print(f"独立GUI进程已启动，PID: {self.gui_process.pid}")
+
+            # 等待GUI进程初始化
+            time.sleep(2.0)
+
+        except Exception as e:
+            print(f"启动独立GUI进程失败: {e}")
+            self.gui_process = None
+
+    def _stop_standalone_gui(self):
+        """
+        停止独立的GUI进程
+        """
+        if self.gui_process is None:
+            return
+
+        try:
+            if self.gui_process.poll() is None:  # 进程仍在运行
+                print("正在终止GUI进程...")
+
+                # 优雅关闭
+                if os.name == 'nt':  # Windows
+                    self.gui_process.terminate()
+                else:  # Unix-like
+                    self.gui_process.send_signal(signal.SIGTERM)
+
+                # 等待进程结束
+                try:
+                    self.gui_process.wait(timeout=3.0)
+                    print("GUI进程已正常退出")
+                except subprocess.TimeoutExpired:
+                    print("GUI进程未响应，强制终止")
+                    self.gui_process.kill()
+                    self.gui_process.wait()
+            else:
+                print("GUI进程已退出")
+
+        except Exception as e:
+            print(f"停止GUI进程时出错: {e}")
+        finally:
+            self.gui_process = None
 
     def _cleanup_gui_process(self):
         """
-        清理GUI子进程
+        清理GUI进程（保持向后兼容）
         """
-        if self.gui_process is not None and self.gui_process.is_alive():
-            try:
-                # 发送关闭消息
-                if self.gui_pipe is not None:
-                    self.gui_pipe.send({'type': 'shutdown'})
-
-                # 等待子进程结束
-                self.gui_process.join(timeout=2.0)
-
-                if self.gui_process.is_alive():
-                    print("强制终止GUI子进程")
-                    self.gui_process.terminate()
-                    self.gui_process.join()
-
-                print("GUI子进程已清理")
-
-            except Exception as e:
-                print(f"清理GUI子进程失败: {e}")
-            finally:
-                self.gui_process = None
-                self.gui_pipe = None
+        self._stop_standalone_gui()
 
 
 def main():
