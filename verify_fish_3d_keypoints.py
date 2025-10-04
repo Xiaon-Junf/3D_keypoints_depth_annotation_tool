@@ -1209,15 +1209,128 @@ class Fish3DKeypointVerifier:
         except Exception as e:
             print(f"使用matplotlib进行3D可视化失败: {e}")
 
+    def _run_gui_in_main_process(self):
+        """
+        在主进程中运行GUI（Windows兼容模式）
+        """
+        try:
+            import open3d as o3d
+            import threading
+            import platform
+
+            # 设置Open3D环境变量
+            os.environ['OPEN3D_DISABLE_GUI'] = '0'
+            os.environ['OPEN3D_HEADLESS'] = '0'
+            if platform.system() == 'Windows':
+                os.environ['DISPLAY'] = ''
+                os.environ['OPEN3D_USE_NATIVE_WINDOWS_OPENGL'] = '1'
+
+            print("正在创建Open3D可视化窗口...")
+
+            # 创建可视化器
+            local_vis = o3d.visualization.VisualizerWithKeyCallback()
+            local_vis.create_window("局部3D点云", 800, 600)
+
+            global_vis = o3d.visualization.VisualizerWithKeyCallback()
+            global_vis.create_window("全局3D点云 (0-10米)", 800, 600)
+
+            # 设置渲染选项
+            local_vis.get_render_option().background_color = np.asarray([0.1, 0.1, 0.1])
+            global_vis.get_render_option().background_color = np.asarray([0.1, 0.1, 0.1])
+
+            for vis in [local_vis, global_vis]:
+                render_option = vis.get_render_option()
+                render_option.point_size = 2.0
+                render_option.background_color = np.array([0.05, 0.05, 0.05])
+                render_option.light_on = True
+
+            # 创建和添加点云
+            if self.point_cloud_data is not None:
+                # 创建全局点云（0-10米范围）
+                global_pcd = o3d.geometry.PointCloud()
+                global_pcd.points = o3d.utility.Vector3dVector(self.point_cloud_data)
+                global_pcd.colors = o3d.utility.Vector3dVector(self.color_rectify_data.reshape(-1, 3) / 255.0)
+                global_vis.add_geometry(global_pcd)
+
+                # 创建局部点云（过滤范围）
+                local_points = self.point_cloud_data[
+                    (self.point_cloud_data[:, 2] >= self.z_min) &
+                    (self.point_cloud_data[:, 2] <= self.z_max)
+                ]
+                local_colors = self.color_rectify_data[
+                    (self.point_cloud_data[:, 2] >= self.z_min) &
+                    (self.point_cloud_data[:, 2] <= self.z_max)
+                ].reshape(-1, 3) / 255.0
+
+                if len(local_points) > 0:
+                    local_pcd = o3d.geometry.PointCloud()
+                    local_pcd.points = o3d.utility.Vector3dVector(local_points)
+                    local_pcd.colors = o3d.utility.Vector3dVector(local_colors)
+                    local_vis.add_geometry(local_pcd)
+
+            # 添加关键点
+            if self.keypoints:
+                for kp_name, (x, y, z) in self.keypoints.items():
+                    # 翻转X坐标以匹配图像坐标系
+                    height, width = self.depth_data.shape
+                    x_flipped = width - 1 - x
+
+                    # 创建关键点球体
+                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
+                    sphere.translate([x_flipped, y, -z])  # 翻转Z轴
+                    sphere.paint_uniform_color([1.0, 0.0, 0.0])  # 红色关键点
+
+                    local_vis.add_geometry(sphere)
+                    global_vis.add_geometry(sphere)
+
+            # 设置视角
+            local_view_control = local_vis.get_view_control()
+            local_view_control.set_front([0, -0.5, 1])
+            local_view_control.set_lookat([0, 0, 0])
+            local_view_control.set_up([0, -1, 0])
+            local_view_control.set_zoom(0.8)
+
+            global_view_control = global_vis.get_view_control()
+            global_view_control.set_front([0, -0.3, 1])
+            global_view_control.set_lookat([0, 0, 0])
+            global_view_control.set_up([0, -1, 0])
+            global_view_control.set_zoom(0.3)
+
+            print("Open3D可视化窗口已创建，Windows用户请手动关闭窗口以继续")
+
+            # 运行可视化器（阻塞模式）
+            local_vis.run()
+            local_vis.destroy_window()
+            global_vis.run()
+            global_vis.destroy_window()
+
+            print("GUI可视化完成")
+
+        except Exception as e:
+            print(f"Windows兼容模式GUI运行失败: {e}")
+            import traceback
+            traceback.print_exc()
+
     def start_gui_3d_windows(self, event=None):
         """
         启动GUI 3D窗口子进程
         """
+        import platform
+
         if self.gui_process is not None and self.gui_process.is_alive():
             print("GUI 3D窗口已在运行")
             return
 
+        # Windows兼容性处理
+        if platform.system() == 'Windows':
+            print("检测到Windows系统，使用兼容模式启动GUI...")
+            self._run_gui_in_main_process()
+            return
+
         try:
+            # 设置进程启动方式（Linux/macOS使用fork）
+            mp.set_start_method('fork', force=True)
+
             # 创建通信管道
             parent_conn, child_conn = mp.Pipe()
             self.gui_pipe = parent_conn
@@ -1532,11 +1645,19 @@ def run_gui_visualization_worker(args):
         import open3d as o3d
         import threading
         import time
+        import platform
 
         # 设置Open3D环境变量以避免GUI上下文问题
         os.environ['OPEN3D_DISABLE_GUI'] = '0'  # 启用GUI
         os.environ['OPEN3D_HEADLESS'] = '0'     # 非无头模式
-        os.environ['DISPLAY'] = ':0'            # 设置显示（Windows不需要但保持兼容性）
+
+        # Windows特定设置
+        if platform.system() == 'Windows':
+            os.environ['DISPLAY'] = ''  # Windows不需要DISPLAY变量
+            # 设置OpenGL上下文选项
+            os.environ['OPEN3D_USE_NATIVE_WINDOWS_OPENGL'] = '1'
+        else:
+            os.environ['DISPLAY'] = ':0'    # Linux/macOS需要
 
         # 获取参数
         depth_data = args['depth_data']
@@ -1818,13 +1939,31 @@ def run_gui_visualization_worker(args):
                             try:
                                 if saved_local_view_params[0] is not None:
                                     # 恢复局部视角到用户之前的设置
-                                    local_vis.get_view_control().convert_from_pinhole_camera_parameters(saved_local_view_params[0])
-                                    print("已恢复局部视角设置")
+                                    try:
+                                        local_vis.get_view_control().convert_from_pinhole_camera_parameters(saved_local_view_params[0])
+                                        print("已恢复局部视角设置")
+                                    except Exception as view_e:
+                                        print(f"恢复局部视角失败（可能是窗口尺寸不匹配），使用默认视角: {view_e}")
+                                        # 如果恢复失败，使用默认视角设置
+                                        local_view_control = local_vis.get_view_control()
+                                        local_view_control.set_front([0, -0.5, 1])
+                                        local_view_control.set_lookat([0, 0, 0])
+                                        local_view_control.set_up([0, -1, 0])
+                                        local_view_control.set_zoom(0.8)
 
                                 if saved_global_view_params[0] is not None:
                                     # 恢复全局视角到用户之前的设置
-                                    global_vis.get_view_control().convert_from_pinhole_camera_parameters(saved_global_view_params[0])
-                                    print("已恢复全局视角设置")
+                                    try:
+                                        global_vis.get_view_control().convert_from_pinhole_camera_parameters(saved_global_view_params[0])
+                                        print("已恢复全局视角设置")
+                                    except Exception as view_e:
+                                        print(f"恢复全局视角失败（可能是窗口尺寸不匹配），使用默认视角: {view_e}")
+                                        # 如果恢复失败，使用默认视角设置
+                                        global_view_control = global_vis.get_view_control()
+                                        global_view_control.set_front([0, -0.3, 1])
+                                        global_view_control.set_lookat([0, 0, 0])
+                                        global_view_control.set_up([0, -1, 0])
+                                        global_view_control.set_zoom(0.3)
 
                             except Exception as e:
                                 print(f"恢复用户视角失败: {e}")
