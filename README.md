@@ -99,13 +99,13 @@ python verify_fish_3d_keypoints.py --dataset_root fish_dataset --camera_config f
 ### 4. 标注工作流程
 
 1. **启动工具** 加载第一帧数据
-    ![](readme_imgs\image1.png)
+    ![](readme_imgs/image1.png)
 2. **使用Next Fish切换到目标鱼类**
 3. **观察2D界面**确认关键点位置
 4. **点击Global 3D** 启动全局3D可视化，鼠标左键拖动到合适的观察位置
-    ![](readme_imgs\image2.png)
+    ![](readme_imgs/image2.png)
 5. **点击3D View** 启动局部3D可视化，鼠标左键拖动到合适的观察位置
-    ![](readme_imgs\image3.png)
+    ![](readme_imgs/image3.png)
 
     全局点云窗口的作用是, 用户可以观察全局点云，确认一些难以标注的鱼，局部点云窗口的作用是，用户可以更细致地观察局部点云，确认关键点深度是否正确。
 6. **使用Depth滑块** 调整关键点深度
