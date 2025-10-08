@@ -111,6 +111,9 @@ class Fish3DKeypointVerifier:
         # 新增：维护关键点到鱼类的映射关系，用于正确保存
         self.keypoint_to_fish_map = {}  # (x, y) -> fish_name
         
+        # 新增：维护被reset标记的关键点，这些关键点不应该被自动填充深度值
+        self.reset_keypoints = {}  # fish_name -> set(kp_name)
+        
         # 当前帧索引
         self.current_frame_idx = 0
         self.frames = self._get_frames()
@@ -165,6 +168,41 @@ class Fish3DKeypointVerifier:
         except Exception as e:
             print(f"加载相机参数失败: {e}")
             return None
+    
+    def _parse_depth_from_description(self, description: str) -> tuple:
+        """
+        从description字段解析深度值
+        
+        Args:
+            - description (str): 描述字段，格式如 "depth: 524.99mm" 或 "depth: 0.00mm (reset - invalid depth)"
+            
+        Returns:
+            - (tuple) (深度值（毫米）, 是否为重置标记)
+                - 深度值: 浮点数，解析失败返回0.0
+                - 是否为重置标记: bool，True表示用户主动重置为无效深度
+        
+        Notes:
+            - 只搜索label为关键点的深度，如果label为fish（或者group_id为0），则表示当前字段为鱼的框，description字段自然是空的
+            - 如果description包含"reset"标记，表示用户主动标记为无效深度，不应该被自动填充
+        """
+        if not description:
+            return 0.0, False
+        
+        try:
+            # 检查是否包含reset标记
+            import re
+            is_reset = 'reset' in description.lower()
+            
+            # 匹配格式: "depth: XXX.XXmm" 或 "depth: XXXmm"
+            match = re.search(r'depth:\s*([\d.]+)\s*mm', description, re.IGNORECASE)
+            if match:
+                depth_value = float(match.group(1))
+                return depth_value, is_reset
+            else:
+                return 0.0, is_reset
+        except Exception as e:
+            print(f"解析description失败: {description}, 错误: {e}")
+            return 0.0, False
         
     def _parse_keypoints_by_group_id(self):
         """
@@ -174,6 +212,7 @@ class Fish3DKeypointVerifier:
         """
         fish_keypoints = {}
         keypoint_to_fish_map = {}  # (x, y) -> fish_name
+        reset_keypoints = {}  # fish_name -> set(kp_name)
         current_fish_id = None
         fish_count = 0
 
@@ -186,6 +225,7 @@ class Fish3DKeypointVerifier:
                 fish_count += 1
                 current_fish_id = f"fish_{fish_count}"
                 fish_keypoints[current_fish_id] = {}
+                reset_keypoints[current_fish_id] = set()  # 初始化该鱼的reset集合
                 print(f"找到新的鱼: {current_fish_id}")
 
             # 如果是关键点且group_id为null，分配给当前鱼
@@ -193,11 +233,24 @@ class Fish3DKeypointVerifier:
                 if current_fish_id is not None:
                     point = shape['points'][0]
                     x, y = point[0], point[1]
-                    # 确保所有关键点初始深度值为0.0
-                    fish_keypoints[current_fish_id][shape['label']] = np.array([x, y, 0.0], dtype=np.float32)
+                    
+                    # 尝试从description字段解析深度值
+                    description = shape.get('description', '')
+                    depth_z, is_reset = self._parse_depth_from_description(description)
+                    
+                    # 如果description中没有深度值（返回0.0）且不是reset标记，后续会从深度图获取
+                    # 如果是reset标记，则保持0.0不变
+                    fish_keypoints[current_fish_id][shape['label']] = np.array([x, y, depth_z], dtype=np.float32)
+                    
                     # 建立坐标到鱼的映射
                     keypoint_to_fish_map[(x, y)] = current_fish_id
-                    print(f"将关键点 '{shape['label']}' 分配给 {current_fish_id}")
+                    
+                    # 如果是reset标记，记录到reset_keypoints集合中
+                    if is_reset:
+                        reset_keypoints[current_fish_id].add(shape['label'])
+                        print(f"将关键点 '{shape['label']}' 分配给 {current_fish_id}, 深度: {depth_z:.2f}mm (已重置为无效)")
+                    else:
+                        print(f"将关键点 '{shape['label']}' 分配给 {current_fish_id}, 深度: {depth_z:.2f}mm")
                 else:
                     print(f"警告: 关键点 '{shape['label']}' 没有对应的鱼，将被忽略")
 
@@ -209,16 +262,12 @@ class Fish3DKeypointVerifier:
         if fish_keypoints:
             print(f"成功解析 {len(fish_keypoints)} 条鱼的关键点:")
             for fish_name, kps in fish_keypoints.items():
-                print(f"  {fish_name}: {len(kps)} 个关键点 - {list(kps.keys())}")
+                reset_count = len(reset_keypoints.get(fish_name, set()))
+                print(f"  {fish_name}: {len(kps)} 个关键点 - {list(kps.keys())} (其中 {reset_count} 个已重置)")
         else:
             print("警告: 没有找到任何鱼的关键点")
 
-        # 初始化所有鱼类的关键点深度值
-        for fish_name, keypoints in fish_keypoints.items():
-            for kp_name, kp_coords in keypoints.items():
-                keypoints[kp_name] = np.array([kp_coords[0], kp_coords[1], 0.0], dtype=np.float32)
-
-        return fish_keypoints, keypoint_to_fish_map
+        return fish_keypoints, keypoint_to_fish_map, reset_keypoints
 
     def _get_frames(self):
         """
@@ -320,7 +369,7 @@ class Fish3DKeypointVerifier:
                 print(f"标注文件包含 {len(self.annotation_data['shapes'])} 个形状")
 
                 # 解析关键点，按鱼类分组
-                self.fish_keypoints, self.keypoint_to_fish_map = self._parse_keypoints_by_group_id()
+                self.fish_keypoints, self.keypoint_to_fish_map, self.reset_keypoints = self._parse_keypoints_by_group_id()
                 self.fish_names = list(self.fish_keypoints.keys())
                 self.current_fish_idx = 0 if self.fish_names else -1
 
@@ -341,7 +390,7 @@ class Fish3DKeypointVerifier:
                         self.annotation_data = json.load(f)
                     print(f"使用默认标注文件: {self.annotation_file}")
                     # 解析关键点
-                    self.fish_keypoints, self.keypoint_to_fish_map = self._parse_keypoints_by_group_id()
+                    self.fish_keypoints, self.keypoint_to_fish_map, self.reset_keypoints = self._parse_keypoints_by_group_id()
                     self.fish_names = list(self.fish_keypoints.keys())
                     self.current_fish_idx = 0 if self.fish_names else -1
                     if self.fish_names:
@@ -355,6 +404,7 @@ class Fish3DKeypointVerifier:
                     self.current_fish_idx = -1
                     self.keypoints = {}
                     self.keypoint_names = []
+                    self.reset_keypoints = {}
         except Exception as e:
             print(f"加载标注文件失败: {e}")
             self.annotation_data = None
@@ -363,6 +413,7 @@ class Fish3DKeypointVerifier:
             self.current_fish_idx = -1
             self.keypoints = {}
             self.keypoint_names = []
+            self.reset_keypoints = {}
 
         # 读取深度图 - 使用深度读取器正确转换视差到深度
         try:
@@ -542,9 +593,16 @@ class Fish3DKeypointVerifier:
             # 恢复用户调整的深度值（如果之前调整过）
             for kp_name, kp_value in self.keypoints.items():
                 if fish_name in saved_depths and kp_name in saved_depths[fish_name]:
-                    # 如果之前有调整过深度值，则保留调整后的值
-                    if saved_depths[fish_name][kp_name] != 0.0:  # 0.0表示未调整
+                    # 检查是否是被reset标记的关键点
+                    is_reset_kp = fish_name in self.reset_keypoints and kp_name in self.reset_keypoints[fish_name]
+                    
+                    if is_reset_kp:
+                        # 如果是reset标记的关键点，强制保持为0，不从深度图读取
+                        self.keypoints[kp_name][2] = 0.0
+                    elif saved_depths[fish_name][kp_name] != 0.0:
+                        # 如果之前有标注过深度值（不为0），则保留标注后的值
                         self.keypoints[kp_name][2] = saved_depths[fish_name][kp_name]
+                    # 否则使用从深度图读取的新值（已在_update_keypoint_depths中更新）
         
         # 恢复当前鱼类索引和关键点
         self.current_fish_idx = current_fish_idx
@@ -653,6 +711,34 @@ class Fish3DKeypointVerifier:
 
         # 发送更新消息到GUI子进程
         self._send_gui_update()
+    
+    def increase_depth(self, event=None):
+        """
+        增加当前关键点的深度值1mm
+        """
+        if not self.keypoint_names:
+            return
+        
+        current_kp_name = self.keypoint_names[self.current_kp_idx]
+        current_depth = self.keypoints[current_kp_name][2]
+        new_depth = min(10000.0, current_depth + 1.0)  # 限制最大值为10000mm
+        
+        # 更新滑块值（会触发adjust_depth）
+        self.depth_slider.set_val(new_depth)
+    
+    def decrease_depth(self, event=None):
+        """
+        减少当前关键点的深度值1mm
+        """
+        if not self.keypoint_names:
+            return
+        
+        current_kp_name = self.keypoint_names[self.current_kp_idx]
+        current_depth = self.keypoints[current_kp_name][2]
+        new_depth = max(0.0, current_depth - 1.0)  # 限制最小值为0mm
+        
+        # 更新滑块值（会触发adjust_depth）
+        self.depth_slider.set_val(new_depth)
     
     def _update_3d_keypoint_position(self):
         """
@@ -963,6 +1049,11 @@ class Fish3DKeypointVerifier:
         if current_fish_name in self.fish_keypoints:
             for kp_name in self.fish_keypoints[current_fish_name].keys():
                 self.fish_keypoints[current_fish_name][kp_name][2] = 0.0
+        
+        # 将当前鱼的所有关键点添加到reset_keypoints集合中
+        if current_fish_name not in self.reset_keypoints:
+            self.reset_keypoints[current_fish_name] = set()
+        self.reset_keypoints[current_fish_name].update(self.keypoints.keys())
 
         # 更新标注文件中的description字段 - 只更新属于当前鱼的关键点
         if self.annotation_data and 'shapes' in self.annotation_data:
@@ -1047,13 +1138,27 @@ class Fish3DKeypointVerifier:
             # elif name == 'gui_3d':
             #     btn.on_clicked(self.start_gui_3d_windows)
         
-        # 创建深度调整滑块
-        ax_depth = plt.axes([0.2, 0.12, 0.6, 0.03])
+        # 创建深度调整滑块及增减按钮
+        # 减少按钮（滑块左侧）
+        ax_depth_minus = plt.axes([0.15, 0.12, 0.03, 0.03])
+        btn_depth_minus = Button(ax_depth_minus, '-')
+        btn_depth_minus.on_clicked(self.decrease_depth)
+        self.buttons['depth_minus'] = btn_depth_minus
+        
+        # 深度滑块（中间）
+        ax_depth = plt.axes([0.19, 0.12, 0.62, 0.03])
         self.depth_slider = Slider(
             ax_depth, 'Depth (mm)', 0, 10000,  # 限制在10米范围内
-            valinit=0, valfmt='%d'
+            valinit=0, valfmt='%d',
+            valstep=1.0  # 添加1mm步长，提高精度
         )
         self.depth_slider.on_changed(self.adjust_depth)
+        
+        # 增加按钮（滑块右侧）
+        ax_depth_plus = plt.axes([0.82, 0.12, 0.03, 0.03])
+        btn_depth_plus = Button(ax_depth_plus, '+')
+        btn_depth_plus.on_clicked(self.increase_depth)
+        self.buttons['depth_plus'] = btn_depth_plus
         
         # 设置图形属性
         self.fig.canvas.manager.set_window_title('鱼类关键点3D坐标验证工具')
@@ -1734,7 +1839,16 @@ class Fish3DKeypointVerifier:
             else:
                 print(f"原标注文件不存在: {current_annotation_file}，将直接保存")
 
-            # 更新标注数据 - 只更新属于当前帧的关键点
+            # 获取当前鱼的名称
+            if not self.fish_names or self.current_fish_idx < 0:
+                print("没有当前鱼类信息，无法保存")
+                return
+
+            current_fish_name = self.fish_names[self.current_fish_idx]
+            print(f"准备保存当前鱼类 '{current_fish_name}' 的深度值")
+
+            # 更新标注数据 - 只更新当前鱼的关键点
+            updated_count = 0
             for shape in self.annotation_data['shapes']:
                 if shape['shape_type'] == 'point':
                     point = shape['points'][0]
@@ -1743,17 +1857,24 @@ class Fish3DKeypointVerifier:
                     # 根据坐标找到这个点属于哪条鱼
                     if (x, y) in self.keypoint_to_fish_map:
                         fish_name = self.keypoint_to_fish_map[(x, y)]
-                        kp_name = shape['label']
+                        
+                        # 只更新当前鱼的关键点
+                        if fish_name == current_fish_name:
+                            kp_name = shape['label']
 
-                        # 从对应的鱼类中获取深度值
-                        if fish_name in self.fish_keypoints and kp_name in self.fish_keypoints[fish_name]:
-                            depth_value = self.fish_keypoints[fish_name][kp_name][2]
-                            # 在描述中添加深度信息
-                            shape['description'] = f"depth: {depth_value:.2f}mm"
-                        else:
-                            print(f"警告: 找不到鱼类 {fish_name} 中关键点 {kp_name} 的深度数据")
+                            # 从对应的鱼类中获取深度值
+                            if fish_name in self.fish_keypoints and kp_name in self.fish_keypoints[fish_name]:
+                                depth_value = self.fish_keypoints[fish_name][kp_name][2]
+                                # 在描述中添加深度信息
+                                shape['description'] = f"depth: {depth_value:.2f}mm"
+                                updated_count += 1
+                                print(f"更新关键点 '{kp_name}' 深度: {depth_value:.2f}mm")
+                            else:
+                                print(f"警告: 找不到鱼类 {fish_name} 中关键点 {kp_name} 的深度数据")
                     else:
                         print(f"警告: 关键点坐标 ({x:.1f}, {y:.1f}) 不在映射表中")
+
+            print(f"成功更新当前鱼类 '{current_fish_name}' 的 {updated_count} 个关键点深度值")
 
             # 保存文件到当前标注文件路径
             with open(current_annotation_file, 'w', encoding='utf-8') as f:
