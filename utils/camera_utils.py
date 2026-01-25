@@ -251,5 +251,64 @@ def sample_z_init_from_hrnet_and_depth(hrnet_coords: 'torch.Tensor',
     
     # 使用与simple_depth_reader相同的归一化策略
     z_normalized = torch.clamp(z_camera_mm, 0, depth_max_value) / depth_max_value  # [B, 17, 1]
-    
+
     return z_normalized
+
+
+def project_left_to_right(x_left: float, y_left: float, depth: float,
+                          fx: float, baseline: float) -> Tuple[float, float]:
+    """
+    将左图像素坐标投影到右图（极线校准后的简化版本）
+
+    由于图像已经过极线校准（rectified），极线变为水平线，
+    同一3D点在左右图的y坐标相同，只有x坐标因视差而不同。
+
+    Args:
+        x_left: 左图x坐标（像素）
+        y_left: 左图y坐标（像素）
+        depth: 深度值（mm）
+        fx: 左相机焦距（像素）
+        baseline: 基线距离（mm），即左右相机光心之间的距离
+
+    Returns:
+        (x_right, y_right): 右图坐标（像素）
+
+    Note:
+        视差公式: disparity = (fx * baseline) / depth
+        右图x坐标: x_right = x_left - disparity
+        右图y坐标: y_right = y_left（极线校准后相同）
+    """
+    if depth <= 0:
+        # 深度无效时返回原坐标
+        return x_left, y_left
+
+    # 计算视差
+    disparity = (fx * baseline) / depth
+
+    # 计算右图坐标
+    x_right = x_left - disparity
+    y_right = y_left  # 极线校准后y坐标相同
+
+    return x_right, y_right
+
+
+def project_keypoints_left_to_right(keypoints: Dict[str, list],
+                                    fx: float,
+                                    baseline: float) -> Dict[str, Tuple[float, float]]:
+    """
+    批量将左图关键点投影到右图
+
+    Args:
+        keypoints: 关键点字典，格式为 {name: [x, y, depth]}
+        fx: 左相机焦距（像素）
+        baseline: 基线距离（mm）
+
+    Returns:
+        右图关键点字典，格式为 {name: (x_right, y_right)}
+    """
+    right_keypoints = {}
+    for name, kp in keypoints.items():
+        x_left, y_left, depth = kp[0], kp[1], kp[2]
+        x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
+        right_keypoints[name] = (x_right, y_right)
+    return right_keypoints

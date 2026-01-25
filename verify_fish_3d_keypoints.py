@@ -55,7 +55,7 @@ sys.path.insert(0, lib_path)
 
 try:
     from utils.simple_depth_reader import SimpleDepthReader
-    from utils.camera_utils import convert_joints_to_camera_coords
+    from utils.camera_utils import convert_joints_to_camera_coords, project_left_to_right, project_keypoints_left_to_right
 except ImportError as e:
     print(f"导入模块失败: {e}")
     print("请确保在正确的环境中运行此脚本")
@@ -146,8 +146,26 @@ class Fish3DKeypointVerifier:
         
         # 图像数据
         self.image_data = None
+        self.right_image_data = None  # 右图数据
         self.color_rectify_data = None  # 用于点云着色的彩色图像
-        
+
+        # 标签显示控制
+        self.show_labels = True  # 默认显示标签
+
+        # 同步深度调整模式
+        self.sync_depth_mode = False  # 同步调整当前鱼所有关键点
+        self.last_depth_value = 0.0   # 记录上次深度值用于计算delta
+
+        # 立体视觉重叠区域（SGBM算法计算的硬编码值）
+        self.OVERLAP_X_MIN = 256
+        self.OVERLAP_X_MAX = 1439
+
+        # 右图拖动状态
+        self.dragging_right = False  # 是否正在拖动右图关键点
+        self.drag_kp_name = None     # 正在拖动的关键点名称
+        self.drag_start_x = None     # 拖动起始x坐标
+        self.drag_mode_global = False  # 拖动模式：False=单个（仅当前点），True=全局（任意点）
+
         # 立即创建图形界面
         self._create_figure()
         
@@ -357,6 +375,20 @@ class Fish3DKeypointVerifier:
             print(f"加载图像失败: {e}")
             self.image_data = None
 
+        # 读取右图
+        try:
+            right_image_path = os.path.join(images_root, 'right', current_frame_name)
+            if os.path.exists(right_image_path):
+                self.right_image_data = cv2.imread(right_image_path)
+                self.right_image_data = cv2.cvtColor(self.right_image_data, cv2.COLOR_BGR2RGB)
+                print(f"成功加载右图: {right_image_path}, 尺寸: {self.right_image_data.shape}")
+            else:
+                print(f"右图文件不存在: {right_image_path}")
+                self.right_image_data = None
+        except Exception as e:
+            print(f"加载右图失败: {e}")
+            self.right_image_data = None
+
         # 设置color_rectify图像（假设与显示图像相同）
         self.color_rectify_data = self.image_data
 
@@ -459,9 +491,12 @@ class Fish3DKeypointVerifier:
             
         # 更新所有鱼类关键点的深度值
         self._update_all_fish_keypoint_depths()
-        
+
         # 加载点云数据
         self._load_point_cloud_data(depth_file_path)
+
+        # 更新显示（确保初始化时绘制竖线等UI元素）
+        self.update_display()
     
     def _load_point_cloud_data(self, frame_path):
         """
@@ -675,6 +710,11 @@ class Fish3DKeypointVerifier:
         self.current_kp_idx = 0 if self.keypoint_names else -1
         print(f"切换到鱼类: {fish_name}, 包含 {len(self.keypoint_names)} 个关键点")
 
+        # 更新同步模式的基准深度值
+        if self.keypoint_names:
+            current_kp_name = self.keypoint_names[self.current_kp_idx]
+            self.last_depth_value = self.keypoints[current_kp_name][2]
+
         # 不再更新关键点深度值，保留用户调整的值
         # self._update_keypoint_depths()
         # 更新点云过滤范围
@@ -692,13 +732,28 @@ class Fish3DKeypointVerifier:
     def adjust_depth(self, val):
         """
         调整当前关键点的深度值
+        同步模式下会同时调整当前鱼的所有关键点
         """
         if self.updating_slider or not self.keypoint_names:
             return
-            
+
         current_kp_name = self.keypoint_names[self.current_kp_idx]
-        print(f"调整关键点 {current_kp_name} 的深度值为: {val}")
-        self.keypoints[current_kp_name][2] = float(val)
+
+        if self.sync_depth_mode:
+            # 同步模式：计算深度变化量并应用到所有关键点
+            delta = float(val) - self.last_depth_value
+            print(f"同步调整所有关键点深度，delta: {delta:.1f}mm")
+            for kp_name in self.keypoint_names:
+                old_depth = self.keypoints[kp_name][2]
+                new_depth = max(0.0, min(10000.0, old_depth + delta))
+                self.keypoints[kp_name][2] = new_depth
+            # 更新基准值
+            self.last_depth_value = float(val)
+        else:
+            # 单点模式：只调整当前关键点
+            print(f"调整关键点 {current_kp_name} 的深度值为: {val}")
+            self.keypoints[current_kp_name][2] = float(val)
+
         # 更新点云过滤范围以适应新的深度值
         self._filter_point_cloud()
         self.update_display()
@@ -996,20 +1051,26 @@ class Fish3DKeypointVerifier:
         """
         if not self.keypoint_names:
             return
-            
+
         self.current_kp_idx = (self.current_kp_idx + 1) % len(self.keypoint_names)
         print(f"切换到关键点索引: {self.current_kp_idx}")
+        # 更新同步模式的基准深度值
+        current_kp_name = self.keypoint_names[self.current_kp_idx]
+        self.last_depth_value = self.keypoints[current_kp_name][2]
         self.update_display()
-    
+
     def prev_keypoint(self, event=None):
         """
         切换到上一个关键点
         """
         if not self.keypoint_names:
             return
-            
+
         self.current_kp_idx = (self.current_kp_idx - 1) % len(self.keypoint_names)
         print(f"切换到关键点索引: {self.current_kp_idx}")
+        # 更新同步模式的基准深度值
+        current_kp_name = self.keypoint_names[self.current_kp_idx]
+        self.last_depth_value = self.keypoints[current_kp_name][2]
         self.update_display()
     
     def refresh_point_cloud(self, event=None):
@@ -1086,24 +1147,30 @@ class Fish3DKeypointVerifier:
         创建图形界面 - 在初始化时立即创建
         """
         print("创建图形界面")
-        # 创建图形界面
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        plt.subplots_adjust(bottom=0.3) 
+        # 创建双子图布局（左图 + 右图）
+        self.fig, (self.ax_left, self.ax_right) = plt.subplots(1, 2, figsize=(18, 8))
+        self.ax = self.ax_left  # 保持向后兼容
+        plt.subplots_adjust(bottom=0.25, wspace=0.05)  # 调整底部空间和子图间距 
         
-        # 创建按钮
+        # 创建按钮 - 多行网格布局
         button_props = {
+            # 第1行 (y=0.05): 导航按钮
             'prev_frame': {'rect': [0.05, 0.05, 0.08, 0.04], 'label': 'Prev Frame'},
             'next_frame': {'rect': [0.14, 0.05, 0.08, 0.04], 'label': 'Next Frame'},
             'prev_fish': {'rect': [0.23, 0.05, 0.08, 0.04], 'label': 'Prev Fish'},
             'next_fish': {'rect': [0.32, 0.05, 0.08, 0.04], 'label': 'Next Fish'},
             'prev_kp': {'rect': [0.41, 0.05, 0.08, 0.04], 'label': 'Prev KP'},
             'next_kp': {'rect': [0.50, 0.05, 0.08, 0.04], 'label': 'Next KP'},
-            'refresh_pc': {'rect': [0.59, 0.05, 0.08, 0.04], 'label': 'Refresh PC'},
-            'reset_depth': {'rect': [0.68, 0.05, 0.08, 0.04], 'label': 'Reset Depth'},
-            'save': {'rect': [0.77, 0.05, 0.08, 0.04], 'label': 'Save'},
-            '3d_view': {'rect': [0.86, 0.05, 0.08, 0.04], 'label': '3D View'},
-            'global_3d': {'rect': [0.05, 0.10, 0.08, 0.04], 'label': 'Global 3D'},
-            # 'gui_3d': {'rect': [0.14, 0.10, 0.12, 0.04], 'label': 'GUI 3D Windows'}
+            'save': {'rect': [0.59, 0.05, 0.08, 0.04], 'label': 'Save'},
+
+            # 第2行 (y=0.10): 视图和控制按钮
+            'refresh_pc': {'rect': [0.05, 0.10, 0.08, 0.04], 'label': 'Refresh PC'},
+            'reset_depth': {'rect': [0.14, 0.10, 0.08, 0.04], 'label': 'Reset Depth'},
+            '3d_view': {'rect': [0.23, 0.10, 0.08, 0.04], 'label': '3D View'},
+            'global_3d': {'rect': [0.32, 0.10, 0.08, 0.04], 'label': 'Global 3D'},
+            'toggle_labels': {'rect': [0.41, 0.10, 0.08, 0.04], 'label': 'Labels: ON'},
+            'sync_fish': {'rect': [0.50, 0.10, 0.08, 0.04], 'label': 'Sync: OFF'},
+            'drag_mode': {'rect': [0.59, 0.10, 0.08, 0.04], 'label': 'Drag: Single'},
         }
         
         # 创建按钮并连接事件
@@ -1135,6 +1202,12 @@ class Fish3DKeypointVerifier:
                 btn.on_clicked(self.visualize_3d)
             elif name == 'global_3d':
                 btn.on_clicked(self.visualize_global_3d)
+            elif name == 'toggle_labels':
+                btn.on_clicked(self.toggle_labels)
+            elif name == 'sync_fish':
+                btn.on_clicked(self.toggle_sync_mode)
+            elif name == 'drag_mode':
+                btn.on_clicked(self.toggle_drag_mode)
             # elif name == 'gui_3d':
             #     btn.on_clicked(self.start_gui_3d_windows)
         
@@ -1162,85 +1235,334 @@ class Fish3DKeypointVerifier:
         
         # 设置图形属性
         self.fig.canvas.manager.set_window_title('鱼类关键点3D坐标验证工具')
+
+        # 连接右图鼠标事件用于拖动
+        self.fig.canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.fig.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        self.fig.canvas.mpl_connect('button_release_event', self._on_mouse_release)
     
     def update_display(self):
         """
-        更新显示
+        更新显示 - 左右图并排显示，带参考竖线
         """
         if self.updating_display:
             return
-            
+
         self.updating_display = True
         try:
-            if self.ax is None:
+            if self.ax_left is None:
                 return
-                
-            self.ax.clear()
-            
-            # 优先显示去畸变图像
+
+            # 保存当前视图范围（用于放大镜工具保持）
+            left_xlim = self.ax_left.get_xlim() if self.ax_left.get_images() else None
+            left_ylim = self.ax_left.get_ylim() if self.ax_left.get_images() else None
+            right_xlim = self.ax_right.get_xlim() if self.ax_right.get_images() else None
+            right_ylim = self.ax_right.get_ylim() if self.ax_right.get_images() else None
+
+            # 清空左右子图
+            self.ax_left.clear()
+            self.ax_right.clear()
+
+            # 获取相机参数用于投影计算
+            fx, baseline = self._get_stereo_params()
+
+            # ========== 左图显示 ==========
             if self.image_data is not None:
                 try:
-                    self.ax.imshow(self.image_data)
+                    self.ax_left.imshow(self.image_data)
                 except Exception as e:
-                    print(f"显示去畸变图像失败: {e}")
-                    # 如果图像显示失败，显示深度图
+                    print(f"显示左图失败: {e}")
                     if self.depth_data is not None:
                         depth_display = np.clip(self.depth_data, 0, 10000) / 10000
-                        self.ax.imshow(depth_display, cmap='jet')
+                        self.ax_left.imshow(depth_display, cmap='jet')
             else:
-                # 如果没有图像数据，显示深度图
                 if self.depth_data is not None:
                     depth_display = np.clip(self.depth_data, 0, 10000) / 10000
-                    self.ax.imshow(depth_display, cmap='jet')
+                    self.ax_left.imshow(depth_display, cmap='jet')
                 else:
-                    self.ax.text(0.5, 0.5, '无法加载图像和深度数据', 
-                                horizontalalignment='center', 
-                                verticalalignment='center',
-                                transform=self.ax.transAxes)
-                    self.fig.canvas.draw_idle()
-                    return
-            
-            # 绘制关键点
+                    self.ax_left.text(0.5, 0.5, '无法加载左图',
+                                     horizontalalignment='center',
+                                     verticalalignment='center',
+                                     transform=self.ax_left.transAxes)
+
+            # ========== 右图显示 ==========
+            if self.right_image_data is not None:
+                try:
+                    self.ax_right.imshow(self.right_image_data)
+                except Exception as e:
+                    print(f"显示右图失败: {e}")
+                    self.ax_right.text(0.5, 0.5, '右图显示失败',
+                                      horizontalalignment='center',
+                                      verticalalignment='center',
+                                      transform=self.ax_right.transAxes)
+            else:
+                self.ax_right.text(0.5, 0.5, '右图不可用',
+                                  horizontalalignment='center',
+                                  verticalalignment='center',
+                                  transform=self.ax_right.transAxes)
+
+            # ========== 绘制关键点和参考线 ==========
             if self.keypoint_names:
+                # 获取图像高度用于绘制竖线
+                img_height = self.image_data.shape[0] if self.image_data is not None else 1080
+                img_width = self.image_data.shape[1] if self.image_data is not None else 1440
+
                 for i, (name, kp) in enumerate(self.keypoints.items()):
-                    color = 'red' if i == self.current_kp_idx else 'blue'
-                    self.ax.plot(kp[0], kp[1], 'o', color=color, markersize=8, markeredgewidth=2)
-                    self.ax.text(kp[0]+10, kp[1]+10, f"{name}\n{kp[2]:.0f}mm", 
-                                color=color, fontsize=10, weight='bold',
-                                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
-                
+                    is_current = (i == self.current_kp_idx)
+                    color = 'red' if is_current else 'blue'
+                    x_left, y_left, depth = kp[0], kp[1], kp[2]
+
+                    # 计算右图映射点
+                    x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
+
+                    # 左图：绘制关键点
+                    self.ax_left.plot(x_left, y_left, 'o', color=color, markersize=8, markeredgewidth=2)
+                    if self.show_labels:
+                        self.ax_left.text(x_left+10, y_left+10, f"{name}\n{depth:.0f}mm",
+                                         color=color, fontsize=9, weight='bold',
+                                         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+
+                    # 右图：绘制映射点（仅在重叠区域内）
+                    if self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX:
+                        self.ax_right.plot(x_right, y_right, 'o', color=color, markersize=8,
+                                          markeredgewidth=2, fillstyle='none')  # 空心圆
+                        if self.show_labels:
+                            self.ax_right.text(x_right+10, y_right+10, f"{name}",
+                                              color=color, fontsize=9, weight='bold',
+                                              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+
+                    # 绘制参考竖线（仅对当前关键点）
+                    if is_current:
+                        self._draw_reference_lines(self.ax_left, x_left, img_height, img_width, is_main=True)
+                        self._draw_reference_lines(self.ax_right, x_right, img_height, img_width, is_main=True)
+
                 # 高亮当前关键点
                 if self.current_kp_idx < len(self.keypoint_names):
                     current_kp_name = self.keypoint_names[self.current_kp_idx]
                     current_kp = self.keypoints[current_kp_name]
-                    self.ax.plot(current_kp[0], current_kp[1], 'o', color='yellow', 
-                               markersize=12, markeredgewidth=3, markeredgecolor='red')
-                
+                    x_left, y_left, depth = current_kp[0], current_kp[1], current_kp[2]
+                    x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
+
+                    # 左图高亮
+                    self.ax_left.plot(x_left, y_left, 'o', color='yellow',
+                                     markersize=12, markeredgewidth=3, markeredgecolor='red')
+                    # 右图高亮（仅在重叠区域内）
+                    if self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX:
+                        self.ax_right.plot(x_right, y_right, 'o', color='yellow',
+                                          markersize=12, markeredgewidth=3, markeredgecolor='red',
+                                          fillstyle='none')
+
                 # 更新标题
                 frame_name = self.frames[self.current_frame_idx] if self.frames else "未知"
                 fish_name = self.fish_names[self.current_fish_idx] if self.fish_names else "未知"
                 current_kp_name = self.keypoint_names[self.current_kp_idx] if self.keypoint_names else "未知"
                 current_depth = self.keypoints[current_kp_name][2] if self.keypoint_names else 0
-                
-                self.ax.set_title(f"Frame: {frame_name} | Fish: {fish_name} | Keypoint: {current_kp_name} (Depth: {current_depth:.2f}mm)",
-                                 fontsize=14, weight='bold')
-                
+
+                # 计算当前关键点的视差
+                disparity = (fx * baseline) / current_depth if current_depth > 0 else 0
+
+                self.fig.suptitle(f"Frame: {frame_name} | Fish: {fish_name} | Keypoint: {current_kp_name} | Depth: {current_depth:.0f}mm | Disparity: {disparity:.1f}px",
+                                 fontsize=12, weight='bold')
+
                 # 更新滑块
                 if self.keypoint_names:
                     self.updating_slider = True
                     self.depth_slider.set_val(current_depth)
                     self.updating_slider = False
-            
-            self.ax.set_xlabel('X (像素坐标)')
-            self.ax.set_ylabel('Y (像素坐标)')
-            
+
+            # 设置子图标签
+            self.ax_left.set_title('Left', fontsize=11)
+            self.ax_left.set_xlabel('X (pixels)')
+            self.ax_left.set_ylabel('Y (pixels)')
+
+            self.ax_right.set_title('Right - Projected Points', fontsize=11)
+            self.ax_right.set_xlabel('X (pixels)')
+            self.ax_right.set_ylabel('Y (pixels)')
+
+            # 恢复视图范围（保持放大镜工具状态）
+            if left_xlim is not None:
+                self.ax_left.set_xlim(left_xlim)
+                self.ax_left.set_ylim(left_ylim)
+            if right_xlim is not None:
+                self.ax_right.set_xlim(right_xlim)
+                self.ax_right.set_ylim(right_ylim)
+
             self.fig.canvas.draw_idle()
-            
+
         except Exception as e:
             print(f"更新显示失败: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             self.updating_display = False
-    
+
+    def _draw_reference_lines(self, ax, x_center, img_height, img_width, is_main=True, interval=50):
+        """
+        绘制参考竖线（铺满全图）
+
+        Args:
+            ax: matplotlib轴对象
+            x_center: 中心x坐标（关键点/映射点位置）
+            img_height: 图像高度
+            img_width: 图像宽度
+            is_main: 是否为主线（关键点位置）
+            interval: 参考线间隔（像素）
+        """
+        # 动态计算需要的线条数量以铺满全图
+        num_lines = img_width // interval + 1
+
+        # 主线（关键点/映射点位置）- 粗线
+        if 0 <= x_center < img_width:
+            ax.axvline(x=x_center, color='lime', linewidth=2, alpha=0.8, linestyle='-')
+
+        # 辅助参考线 - 细线
+        for i in range(1, num_lines + 1):
+            # 左侧参考线
+            x_left = x_center - i * interval
+            if 0 <= x_left < img_width:
+                ax.axvline(x=x_left, color='cyan', linewidth=0.5, alpha=0.4, linestyle='--')
+
+            # 右侧参考线
+            x_right = x_center + i * interval
+            if 0 <= x_right < img_width:
+                ax.axvline(x=x_right, color='cyan', linewidth=0.5, alpha=0.4, linestyle='--')
+
+    def toggle_labels(self, event=None):
+        """切换标签显示状态"""
+        self.show_labels = not self.show_labels
+        # 更新按钮文字
+        btn = self.buttons.get('toggle_labels')
+        if btn:
+            btn.label.set_text('Labels: ON' if self.show_labels else 'Labels: OFF')
+        self.update_display()
+
+    def toggle_sync_mode(self, event=None):
+        """切换同步深度调整模式"""
+        self.sync_depth_mode = not self.sync_depth_mode
+        # 更新按钮文字
+        btn = self.buttons.get('sync_fish')
+        if btn:
+            btn.label.set_text('Sync: ON' if self.sync_depth_mode else 'Sync: OFF')
+        # 记录当前深度值作为基准
+        if self.sync_depth_mode and self.keypoint_names:
+            current_kp_name = self.keypoint_names[self.current_kp_idx]
+            self.last_depth_value = self.keypoints[current_kp_name][2]
+        self.fig.canvas.draw_idle()
+
+    def toggle_drag_mode(self, event=None):
+        """切换右图拖动模式"""
+        self.drag_mode_global = not self.drag_mode_global
+        # 更新按钮文字
+        btn = self.buttons.get('drag_mode')
+        if btn:
+            btn.label.set_text('Drag: Global' if self.drag_mode_global else 'Drag: Single')
+        self.fig.canvas.draw_idle()
+
+    def _get_stereo_params(self):
+        """获取立体视觉参数（fx和baseline）"""
+        fx = self.camera_params.get('camera_matrix_left', {}).get('data', [2351.0])[0] if self.camera_params else 2351.0
+        baseline = abs(self.camera_params.get('T', {}).get('data', [-40.39])[0]) if self.camera_params else 40.39
+        return fx, baseline
+
+    def _check_keypoint_click(self, kp_name, event_x, event_y, fx, baseline, threshold=20):
+        """
+        检查是否点击在指定关键点附近
+
+        Returns:
+            bool: 是否点击在关键点附近
+        """
+        from utils.camera_utils import project_left_to_right
+
+        x_left, y_left, depth = self.keypoints[kp_name]
+
+        # 检查是否在重叠区域
+        if not (self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX):
+            return False
+
+        # 计算右图坐标
+        x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
+
+        # 检查距离
+        dist = ((event_x - x_right)**2 + (event_y - y_right)**2)**0.5
+
+        return dist < threshold
+
+    def _on_mouse_press(self, event):
+        """鼠标按下事件 - 检测是否点击右图关键点"""
+        if event.inaxes != self.ax_right or event.button != 1:
+            return
+
+        if not self.keypoint_names:
+            return
+
+        # 获取相机参数
+        fx, baseline = self._get_stereo_params()
+        click_threshold = 20
+
+        # 确定要检查的关键点列表
+        if self.drag_mode_global:
+            kp_names_to_check = self.keypoint_names
+        else:
+            kp_names_to_check = [self.keypoint_names[self.current_kp_idx]]
+
+        # 检查是否点击在关键点附近
+        for kp_name in kp_names_to_check:
+            if self._check_keypoint_click(kp_name, event.xdata, event.ydata, fx, baseline, click_threshold):
+                self.dragging_right = True
+                self.drag_kp_name = kp_name
+                self.drag_start_x = event.xdata
+                print(f"开始拖动关键点: {kp_name}")
+                break
+
+    def _on_mouse_move(self, event):
+        """鼠标移动事件 - 拖动时更新深度"""
+        if not self.dragging_right or event.inaxes != self.ax_right:
+            return
+
+        if self.drag_kp_name is None:
+            return
+
+        # 获取当前关键点的左图坐标
+        x_left, _, _ = self.keypoints[self.drag_kp_name]
+
+        # 新的右图x坐标
+        x_right_new = event.xdata
+
+        # 反向计算深度
+        fx, baseline = self._get_stereo_params()
+
+        disparity = x_left - x_right_new
+
+        # 防止除零和负深度
+        if disparity <= 0:
+            return
+
+        new_depth = (fx * baseline) / disparity
+
+        # 限制深度范围
+        new_depth = max(0.0, min(10000.0, new_depth))
+
+        # 更新深度
+        self.keypoints[self.drag_kp_name][2] = new_depth
+
+        # 更新滑块（如果当前关键点是正在编辑的）
+        current_kp_name = self.keypoint_names[self.current_kp_idx]
+        if self.drag_kp_name == current_kp_name and self.depth_slider:
+            self.updating_slider = True
+            self.depth_slider.set_val(new_depth)
+            self.updating_slider = False
+
+        # 更新显示
+        self.update_display()
+
+    def _on_mouse_release(self, event):
+        """鼠标释放事件 - 结束拖动"""
+        if self.dragging_right:
+            print(f"结束拖动关键点: {self.drag_kp_name}")
+            self.dragging_right = False
+            self.drag_kp_name = None
+            self.drag_start_x = None
+
     def visualize_3d(self, event=None):
         """
         可视化3D点云，使用color_rectify图像为点云着色

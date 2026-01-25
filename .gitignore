@@ -67,6 +67,9 @@ venv.bak/
 .vscode/
 .idea/
 .cursor/
+.zcf/
+.serena/
+.spec-workflow/
 *.swp
 *.swo
 *~
