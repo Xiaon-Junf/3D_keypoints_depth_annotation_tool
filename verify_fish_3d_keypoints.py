@@ -1150,27 +1150,29 @@ class Fish3DKeypointVerifier:
         # 创建双子图布局（左图 + 右图）
         self.fig, (self.ax_left, self.ax_right) = plt.subplots(1, 2, figsize=(18, 8))
         self.ax = self.ax_left  # 保持向后兼容
-        plt.subplots_adjust(bottom=0.25, wspace=0.05)  # 调整底部空间和子图间距 
+        plt.subplots_adjust(bottom=0.32, wspace=0.05)  # 调整底部空间和子图间距 
         
-        # 创建按钮 - 多行网格布局
+        # 创建按钮 - 优化的多行布局，避免重叠
         button_props = {
-            # 第1行 (y=0.05): 导航按钮
-            'prev_frame': {'rect': [0.05, 0.05, 0.08, 0.04], 'label': 'Prev Frame'},
-            'next_frame': {'rect': [0.14, 0.05, 0.08, 0.04], 'label': 'Next Frame'},
-            'prev_fish': {'rect': [0.23, 0.05, 0.08, 0.04], 'label': 'Prev Fish'},
-            'next_fish': {'rect': [0.32, 0.05, 0.08, 0.04], 'label': 'Next Fish'},
-            'prev_kp': {'rect': [0.41, 0.05, 0.08, 0.04], 'label': 'Prev KP'},
-            'next_kp': {'rect': [0.50, 0.05, 0.08, 0.04], 'label': 'Next KP'},
-            'save': {'rect': [0.59, 0.05, 0.08, 0.04], 'label': 'Save'},
+            # 第1行 (y=0.04): 基础控制与保存
+            'prev_frame': {'rect': [0.08, 0.04, 0.10, 0.04], 'label': 'Prev Frame'},
+            'next_frame': {'rect': [0.19, 0.04, 0.10, 0.04], 'label': 'Next Frame'},
+            'save':       {'rect': [0.30, 0.04, 0.10, 0.04], 'label': 'Save'},
+            'refresh_pc': {'rect': [0.41, 0.04, 0.10, 0.04], 'label': 'Refresh PC'},
+            'reset_depth':{'rect': [0.52, 0.04, 0.10, 0.04], 'label': 'Reset Depth'},
 
-            # 第2行 (y=0.10): 视图和控制按钮
-            'refresh_pc': {'rect': [0.05, 0.10, 0.08, 0.04], 'label': 'Refresh PC'},
-            'reset_depth': {'rect': [0.14, 0.10, 0.08, 0.04], 'label': 'Reset Depth'},
-            '3d_view': {'rect': [0.23, 0.10, 0.08, 0.04], 'label': '3D View'},
-            'global_3d': {'rect': [0.32, 0.10, 0.08, 0.04], 'label': 'Global 3D'},
-            'toggle_labels': {'rect': [0.41, 0.10, 0.08, 0.04], 'label': 'Labels: ON'},
-            'sync_fish': {'rect': [0.50, 0.10, 0.08, 0.04], 'label': 'Sync: OFF'},
-            'drag_mode': {'rect': [0.59, 0.10, 0.08, 0.04], 'label': 'Drag: Single'},
+            # 第2行 (y=0.10): 鱼类与关键点导航
+            'prev_fish':  {'rect': [0.08, 0.10, 0.10, 0.04], 'label': 'Prev Fish'},
+            'next_fish':  {'rect': [0.19, 0.10, 0.10, 0.04], 'label': 'Next Fish'},
+            'prev_kp':    {'rect': [0.30, 0.10, 0.10, 0.04], 'label': 'Prev KP'},
+            'next_kp':    {'rect': [0.41, 0.10, 0.10, 0.04], 'label': 'Next KP'},
+
+            # 第3行 (y=0.16): 视图切换与模式设置
+            '3d_view':      {'rect': [0.08, 0.16, 0.10, 0.04], 'label': '3D View'},
+            'global_3d':    {'rect': [0.19, 0.16, 0.10, 0.04], 'label': 'Global 3D'},
+            'toggle_labels':{'rect': [0.30, 0.16, 0.10, 0.04], 'label': 'Labels: ON'},
+            'sync_fish':    {'rect': [0.41, 0.16, 0.10, 0.04], 'label': 'Sync: OFF'},
+            'drag_mode':    {'rect': [0.52, 0.16, 0.10, 0.04], 'label': 'Drag: Single'},
         }
         
         # 创建按钮并连接事件
@@ -1213,13 +1215,13 @@ class Fish3DKeypointVerifier:
         
         # 创建深度调整滑块及增减按钮
         # 减少按钮（滑块左侧）
-        ax_depth_minus = plt.axes([0.15, 0.12, 0.03, 0.03])
+        ax_depth_minus = plt.axes([0.08, 0.22, 0.03, 0.03])
         btn_depth_minus = Button(ax_depth_minus, '-')
         btn_depth_minus.on_clicked(self.decrease_depth)
         self.buttons['depth_minus'] = btn_depth_minus
         
         # 深度滑块（中间）
-        ax_depth = plt.axes([0.19, 0.12, 0.62, 0.03])
+        ax_depth = plt.axes([0.12, 0.22, 0.70, 0.03])
         self.depth_slider = Slider(
             ax_depth, 'Depth (mm)', 0, 10000,  # 限制在10米范围内
             valinit=0, valfmt='%d',
@@ -1228,7 +1230,7 @@ class Fish3DKeypointVerifier:
         self.depth_slider.on_changed(self.adjust_depth)
         
         # 增加按钮（滑块右侧）
-        ax_depth_plus = plt.axes([0.82, 0.12, 0.03, 0.03])
+        ax_depth_plus = plt.axes([0.83, 0.22, 0.03, 0.03])
         btn_depth_plus = Button(ax_depth_plus, '+')
         btn_depth_plus.on_clicked(self.increase_depth)
         self.buttons['depth_plus'] = btn_depth_plus
