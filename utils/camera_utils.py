@@ -312,3 +312,40 @@ def project_keypoints_left_to_right(keypoints: Dict[str, list],
         x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
         right_keypoints[name] = (x_right, y_right)
     return right_keypoints
+
+
+def project_bbox_left_to_right(x1: float, y1: float, x2: float, y2: float,
+                                depth: float, fx: float, baseline: float) -> Tuple[float, float, float, float]:
+    """
+    将左图矩形 bbox 的4个角点投影到右图，返回包围矩形。
+
+    利用立体视觉视差公式：x_right = x_left - fx * baseline / depth
+    y 方向不变（极线矫正后左右图 y 坐标相同）。
+
+    Args:
+        x1, y1: bbox 左上角像素坐标（左图）
+        x2, y2: bbox 右下角像素坐标（左图）
+        depth:  bbox 对应鱼的代表深度（mm），通常使用该鱼所有关键点平均深度
+        fx:     左相机焦距（像素）
+        baseline: 基线距离（mm）
+
+    Returns:
+        (rx1, ry1, rx2, ry2): 右图包围矩形坐标（浮点）
+    """
+    if depth <= 0:
+        # 深度无效时直接返回原框（无法投影）
+        return x1, y1, x2, y2
+
+    corners = [(x1, y1), (x1, y2), (x2, y1), (x2, y2)]
+    projected_x = []
+    projected_y = []
+    for cx, cy in corners:
+        rx, ry = project_left_to_right(cx, cy, depth, fx, baseline)
+        projected_x.append(rx)
+        projected_y.append(ry)
+
+    rx1 = min(projected_x)
+    ry1 = min(projected_y)
+    rx2 = max(projected_x)
+    ry2 = max(projected_y)
+    return rx1, ry1, rx2, ry2
