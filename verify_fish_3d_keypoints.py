@@ -49,6 +49,52 @@ import multiprocessing as mp
 import threading
 import time
 
+# ====== UI/绘制参数（关键点颜色/尺寸/布局）======
+# 合法关键点名（15个）：每个关键点名固定颜色；非法名称将以红色 × 提示
+ALLOWED_KEYPOINTS = {
+    "mouth",
+    "leye",
+    "reye",
+    "dorsal0",
+    "dorsal1",
+    "dorsal2",
+    "lventral",
+    "rventral",
+    "anal0",
+    "anal1",
+    "anal2",
+    "caudal",
+    "up",
+    "mid",
+    "low",
+}
+
+# 15色高对比固定调色板（保证不同点名明显区分）
+KEYPOINT_COLORS = {
+    "mouth": "#e6194b",     # 红
+    "leye": "#3cb44b",      # 绿
+    "reye": "#4363d8",      # 蓝
+    "dorsal0": "#f58231",   # 橙
+    "dorsal1": "#911eb4",   # 紫
+    "dorsal2": "#46f0f0",   # 青
+    "lventral": "#f032e6",  # 品红
+    "rventral": "#bcf60c",  # 青柠
+    "anal0": "#fabebe",     # 粉
+    "anal1": "#008080",     # 蓝绿
+    "anal2": "#e6beff",     # 淡紫
+    "caudal": "#9a6324",    # 棕
+    "up": "#fffac8",        # 淡黄
+    "mid": "#800000",       # 栗
+    "low": "#aaffc3",       # 淡绿
+}
+
+# 统一点大小
+KP_MARKERSIZE = 3           # 圆点大小
+KP_CROSS_MARKERSIZE = 8     # 叉号大小
+
+# 按钮/控件字体
+BUTTON_FONT_SIZE = 8
+
 # 添加项目路径到系统路径
 lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 sys.path.insert(0, lib_path)
@@ -1233,39 +1279,41 @@ class Fish3DKeypointVerifier:
         # 创建双子图布局（左图 + 右图）
         self.fig, (self.ax_left, self.ax_right) = plt.subplots(1, 2, figsize=(18, 8))
         self.ax = self.ax_left  # 保持向后兼容
-        plt.subplots_adjust(bottom=0.37, wspace=0.05)  # 调整底部空间和子图间距
+        # 将底部控件区压缩到约 20%，给图像留更多空间
+        plt.subplots_adjust(bottom=0.22, wspace=0.05)  # 调整底部空间和子图间距
 
         # 创建按钮 - 优化的多行布局，避免重叠
         button_props = {
             # 第1行 (y=0.04): 基础控制与保存
-            'prev_frame': {'rect': [0.08, 0.04, 0.10, 0.04], 'label': 'Prev Frame'},
-            'next_frame': {'rect': [0.19, 0.04, 0.10, 0.04], 'label': 'Next Frame'},
-            'save':       {'rect': [0.30, 0.04, 0.10, 0.04], 'label': 'Save'},
-            'refresh_pc': {'rect': [0.41, 0.04, 0.10, 0.04], 'label': 'Refresh PC'},
-            'reset_depth':{'rect': [0.52, 0.04, 0.10, 0.04], 'label': 'Delete Right'},
+            'prev_frame': {'rect': [0.08, 0.02, 0.10, 0.03], 'label': 'Prev Frame'},
+            'next_frame': {'rect': [0.19, 0.02, 0.10, 0.03], 'label': 'Next Frame'},
+            'save':       {'rect': [0.30, 0.02, 0.10, 0.03], 'label': 'Save'},
+            'refresh_pc': {'rect': [0.41, 0.02, 0.10, 0.03], 'label': 'Refresh PC'},
+            'reset_depth':{'rect': [0.52, 0.02, 0.10, 0.03], 'label': 'Delete Right'},
 
             # 第2行 (y=0.10): 鱼类与关键点导航
-            'prev_fish':  {'rect': [0.08, 0.10, 0.10, 0.04], 'label': 'Prev Fish'},
-            'next_fish':  {'rect': [0.19, 0.10, 0.10, 0.04], 'label': 'Next Fish'},
-            'prev_kp':    {'rect': [0.30, 0.10, 0.10, 0.04], 'label': 'Prev KP'},
-            'next_kp':    {'rect': [0.41, 0.10, 0.10, 0.04], 'label': 'Next KP'},
+            'prev_fish':  {'rect': [0.08, 0.06, 0.10, 0.03], 'label': 'Prev Fish'},
+            'next_fish':  {'rect': [0.19, 0.06, 0.10, 0.03], 'label': 'Next Fish'},
+            'prev_kp':    {'rect': [0.30, 0.06, 0.10, 0.03], 'label': 'Prev KP'},
+            'next_kp':    {'rect': [0.41, 0.06, 0.10, 0.03], 'label': 'Next KP'},
 
             # 第3行 (y=0.16): 视图切换与模式设置
-            '3d_view':      {'rect': [0.08, 0.16, 0.10, 0.04], 'label': '3D View'},
-            'global_3d':    {'rect': [0.19, 0.16, 0.10, 0.04], 'label': 'Global 3D'},
-            'toggle_labels':{'rect': [0.30, 0.16, 0.10, 0.04], 'label': 'Labels: ON'},
-            'sync_fish':    {'rect': [0.41, 0.16, 0.10, 0.04], 'label': 'Sync: OFF'},
-            'drag_mode':    {'rect': [0.52, 0.16, 0.10, 0.04], 'label': 'Drag: Single'},
+            '3d_view':      {'rect': [0.08, 0.10, 0.10, 0.03], 'label': '3D View'},
+            'global_3d':    {'rect': [0.19, 0.10, 0.10, 0.03], 'label': 'Global 3D'},
+            'toggle_labels':{'rect': [0.30, 0.10, 0.10, 0.03], 'label': 'Labels: ON'},
+            'sync_fish':    {'rect': [0.41, 0.10, 0.10, 0.03], 'label': 'Sync: OFF'},
+            'drag_mode':    {'rect': [0.52, 0.10, 0.10, 0.03], 'label': 'Drag: Single'},
 
             # 第4行 (y=0.22): 右图关键点 group_id 调整（v=可见, a=不存在）
-            'right_kp_visible': {'rect': [0.08, 0.22, 0.14, 0.04], 'label': 'Right KP: Visible [v]'},
-            'right_kp_absent':  {'rect': [0.23, 0.22, 0.14, 0.04], 'label': 'Right KP: Absent [a]'},
+            'right_kp_visible': {'rect': [0.08, 0.14, 0.14, 0.03], 'label': 'Right KP: Visible [v]'},
+            'right_kp_absent':  {'rect': [0.23, 0.14, 0.14, 0.03], 'label': 'Right KP: Absent [a]'},
         }
         
         # 创建按钮并连接事件
         for name, props in button_props.items():
             ax_btn = plt.axes(props['rect'])
             btn = Button(ax_btn, props['label'])
+            btn.label.set_fontsize(BUTTON_FONT_SIZE)
             self.buttons[name] = btn
             
             # 连接事件
@@ -1306,23 +1354,27 @@ class Fish3DKeypointVerifier:
 
         # 创建深度调整滑块及增减按钮
         # 减少按钮（滑块左侧）
-        ax_depth_minus = plt.axes([0.08, 0.28, 0.03, 0.03])
+        ax_depth_minus = plt.axes([0.08, 0.18, 0.03, 0.02])
         btn_depth_minus = Button(ax_depth_minus, '-')
+        btn_depth_minus.label.set_fontsize(BUTTON_FONT_SIZE)
         btn_depth_minus.on_clicked(self.decrease_depth)
         self.buttons['depth_minus'] = btn_depth_minus
 
         # 深度滑块（中间）
-        ax_depth = plt.axes([0.12, 0.28, 0.70, 0.03])
+        ax_depth = plt.axes([0.12, 0.18, 0.70, 0.02])
         self.depth_slider = Slider(
             ax_depth, 'Depth (mm)', 0, 10000,  # 限制在10米范围内
             valinit=0, valfmt='%d',
             valstep=1.0  # 添加1mm步长，提高精度
         )
+        self.depth_slider.label.set_fontsize(BUTTON_FONT_SIZE)
+        self.depth_slider.valtext.set_fontsize(BUTTON_FONT_SIZE)
         self.depth_slider.on_changed(self.adjust_depth)
         
         # 增加按钮（滑块右侧）
-        ax_depth_plus = plt.axes([0.83, 0.28, 0.03, 0.03])
+        ax_depth_plus = plt.axes([0.83, 0.18, 0.03, 0.02])
         btn_depth_plus = Button(ax_depth_plus, '+')
+        btn_depth_plus.label.set_fontsize(BUTTON_FONT_SIZE)
         btn_depth_plus.on_clicked(self.increase_depth)
         self.buttons['depth_plus'] = btn_depth_plus
 
@@ -1408,7 +1460,8 @@ class Fish3DKeypointVerifier:
 
                 for i, (name, kp) in enumerate(self.keypoints.items()):
                     is_current = (i == self.current_kp_idx)
-                    color = 'red' if is_current else 'blue'
+                    is_valid_name = name in ALLOWED_KEYPOINTS
+                    base_color = KEYPOINT_COLORS.get(name, "red") if is_valid_name else "red"
                     x_left, y_left, depth = kp[0], kp[1], kp[2]
 
                     # 计算右图映射点
@@ -1417,38 +1470,107 @@ class Fish3DKeypointVerifier:
                     # 获取该关键点在右图的 group_id
                     right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(name, None) if cur_fish_id_for_loop else None
 
-                    # 左图：绘制关键点
-                    self.ax_left.plot(x_left, y_left, 'o', color=color, markersize=8, markeredgewidth=2)
+                    # 左图：仅表示关键点本身（与右图是否 Absent 无关）
+                    if not is_valid_name:
+                        # 非法名称：红色 × 提示
+                        self.ax_left.plot(
+                            x_left,
+                            y_left,
+                            "x",
+                            color="red",
+                            markersize=KP_CROSS_MARKERSIZE,
+                            markeredgewidth=1.8,
+                        )
+                    else:
+                        # 合法关键点：一律用彩色圆点表示
+                        self.ax_left.plot(
+                            x_left,
+                            y_left,
+                            "o",
+                            color=base_color,
+                            markersize=KP_MARKERSIZE,
+                            markeredgewidth=1.5,
+                        )
                     if self.show_labels:
-                        self.ax_left.text(x_left+10, y_left+10, f"{name}\n{depth:.0f}mm",
-                                         color=color, fontsize=9, weight='bold',
+                        if not is_valid_name:
+                            left_label = f"{name} [INVALID]\n{depth:.0f}mm"
+                        else:
+                            left_label = f"{name}\n{depth:.0f}mm"
+                        self.ax_left.text(x_left+10, y_left+10, left_label,
+                                         color=base_color, fontsize=9, weight='bold',
                                          bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
 
-                    # 右图：绘制映射点（仅在重叠区域内）
-                    if self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX:
-                        if right_gid == 1:
-                            # 关键点不存在：画灰色 × 叉号
-                            self.ax_right.plot(x_right, y_right, 'x', color='gray',
-                                              markersize=12, markeredgewidth=2.5)
+                    # 右图：绘制映射点
+                    # 合法关键点：仅在重叠区域绘制；非法关键点：无论是否在重叠区域，都在右图画红色 × 提示
+                    if (not is_valid_name) or (self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX):
+                        if not is_valid_name:
+                            # 非法名称：右图也必须显示红色 ×
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="red",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=1.8,
+                            )
                             if self.show_labels:
-                                self.ax_right.text(x_right+10, y_right+10, f"{name} [X]",
-                                                  color='gray', fontsize=9, weight='bold',
-                                                  bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+                                self.ax_right.text(
+                                    x_right + 10,
+                                    y_right + 10,
+                                    f"{name} [INVALID]",
+                                    color="red",
+                                    fontsize=9,
+                                    weight="bold",
+                                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
+                                )
+                        elif right_gid == 1:
+                            # 关键点不存在：画灰色 × 叉号
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="gray",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=1.8,
+                            )
+                            if self.show_labels:
+                                self.ax_right.text(
+                                    x_right + 10,
+                                    y_right + 10,
+                                    f"{name} [X]",
+                                    color="gray",
+                                    fontsize=9,
+                                    weight="bold",
+                                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
+                                )
                         else:
                             # 关键点可见：画空心圆
-                            self.ax_right.plot(x_right, y_right, 'o', color=color, markersize=8,
-                                              markeredgewidth=2, fillstyle='none')
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "o",
+                                color=base_color,
+                                markersize=KP_MARKERSIZE,
+                                markeredgewidth=1.5,
+                                fillstyle="none",
+                            )
                             if self.show_labels:
-                                self.ax_right.text(x_right+10, y_right+10, f"{name}",
-                                                  color=color, fontsize=9, weight='bold',
-                                                  bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+                                self.ax_right.text(
+                                    x_right + 10,
+                                    y_right + 10,
+                                    f"{name}",
+                                    color=base_color,
+                                    fontsize=9,
+                                    weight="bold",
+                                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
+                                )
 
                     # 绘制参考竖线（仅对当前关键点）
                     if is_current:
                         self._draw_reference_lines(self.ax_left, x_left, img_height, img_width, is_main=True)
                         self._draw_reference_lines(self.ax_right, x_right, img_height, img_width, is_main=True)
 
-                # 高亮当前关键点
+                # 高亮当前关键点（点大小也保持为3，通过边框强调）
                 if self.current_kp_idx < len(self.keypoint_names):
                     current_kp_name = self.keypoint_names[self.current_kp_idx]
                     current_kp = self.keypoints[current_kp_name]
@@ -1458,19 +1580,60 @@ class Fish3DKeypointVerifier:
                     # 获取当前关键点右图 group_id（复用 cur_fish_id_for_loop）
                     cur_right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(current_kp_name, None) if cur_fish_id_for_loop else None
 
+                    cur_is_valid = current_kp_name in ALLOWED_KEYPOINTS
                     # 左图高亮
-                    self.ax_left.plot(x_left, y_left, 'o', color='yellow',
-                                     markersize=12, markeredgewidth=3, markeredgecolor='red')
+                    if cur_is_valid:
+                        self.ax_left.plot(
+                            x_left,
+                            y_left,
+                            "o",
+                            color="yellow",
+                            markersize=KP_MARKERSIZE,
+                            markeredgewidth=2.2,
+                            markeredgecolor="red",
+                        )
+                    else:
+                        # 非法名称：高亮也用红色 ×
+                        self.ax_left.plot(
+                            x_left,
+                            y_left,
+                            "x",
+                            color="red",
+                            markersize=KP_MARKERSIZE,
+                            markeredgewidth=2.2,
+                        )
                     # 右图高亮（仅在重叠区域内）
-                    if self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX:
-                        if cur_right_gid == 1:
+                    if (not cur_is_valid) or (self.OVERLAP_X_MIN <= x_left <= self.OVERLAP_X_MAX):
+                        if not cur_is_valid:
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="red",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=2.2,
+                            )
+                        elif cur_right_gid == 1:
                             # 不存在：高亮叉号（橙色）
-                            self.ax_right.plot(x_right, y_right, 'x', color='orange',
-                                              markersize=16, markeredgewidth=3.5)
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="orange",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=2.2,
+                            )
                         else:
-                            self.ax_right.plot(x_right, y_right, 'o', color='yellow',
-                                              markersize=12, markeredgewidth=3, markeredgecolor='red',
-                                              fillstyle='none')
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "o",
+                                color="yellow",
+                                markersize=KP_MARKERSIZE,
+                                markeredgewidth=2.2,
+                                markeredgecolor="red",
+                                fillstyle="none",
+                            )
 
                 # 更新标题
                 frame_name = self.frames[self.current_frame_idx] if self.frames else "未知"
