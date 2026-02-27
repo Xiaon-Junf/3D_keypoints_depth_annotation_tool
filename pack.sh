@@ -1,0 +1,3 @@
+cd D:\program\keypoints_validation
+conda activate Deeplearning
+pyinstaller fish_keypoint_verifier.spec

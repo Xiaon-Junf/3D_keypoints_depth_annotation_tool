@@ -43,6 +43,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.7z
+*.zip
+*.rar
+*.spec
 
 # PyTorch
 *.pt
@@ -93,6 +97,7 @@ tmp/
 # 测试文件
 test_result*
 debug_*
+*.log
 
 # 但保留重要的项目文件
 !pipeline.png

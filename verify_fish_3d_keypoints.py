@@ -41,6 +41,7 @@ except ImportError:
         matplotlib.use('Agg')  # 非交互式后端
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider
+from matplotlib.patches import Rectangle
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -101,7 +102,7 @@ sys.path.insert(0, lib_path)
 
 try:
     from utils.simple_depth_reader import SimpleDepthReader
-    from utils.camera_utils import convert_joints_to_camera_coords, project_left_to_right, project_keypoints_left_to_right
+    from utils.camera_utils import convert_joints_to_camera_coords, project_left_to_right, project_keypoints_left_to_right, project_bbox_left_to_right
 except ImportError as e:
     print(f"导入模块失败: {e}")
     print("请确保在正确的环境中运行此脚本")
@@ -197,6 +198,7 @@ class Fish3DKeypointVerifier:
 
         # 标签显示控制
         self.show_labels = True  # 默认显示标签
+        self.show_bboxes = True  # 默认显示矩形框
 
         # 同步深度调整模式
         self.sync_depth_mode = False  # 同步调整当前鱼所有关键点
@@ -220,6 +222,9 @@ class Fish3DKeypointVerifier:
         # 右图整鱼抛弃状态：True = 用户手动抛弃该鱼的右图构建（Delete Right）
         # 用户拖动深度滑块赋值后自动清除，下次 Save 时恢复构建
         self.right_fish_abandoned = {}  # {fish_id: bool}
+
+        # 右图"出画"自定义 group_id：用户通过 Fish Out 按钮设置
+        self.right_fish_out_group_id = {}  # {fish_id: int}
 
         # 立即创建图形界面
         self._create_figure()
@@ -280,7 +285,7 @@ class Fish3DKeypointVerifier:
     def _parse_keypoints_by_group_id(self):
         """
         按照group_id分配逻辑解析关键点，并建立关键点到鱼的映射
-        group_id: 0 表示一条新的鱼
+        fish矩形框（无论group_id为何值）均表示一条新的鱼
         group_id: null 表示属于当前鱼的关键点
         """
         fish_keypoints = {}
@@ -293,8 +298,8 @@ class Fish3DKeypointVerifier:
         for shape in self.annotation_data['shapes']:
             group_id = shape.get('group_id')
 
-            # 如果是矩形且group_id为0，表示一条新的鱼
-            if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish' and group_id == 0:
+            # 如果是fish矩形框，无论group_id为何值，均表示一条新的鱼
+            if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish':
                 fish_count += 1
                 current_fish_id = f"fish_{fish_count}"
                 fish_keypoints[current_fish_id] = {}
@@ -560,13 +565,15 @@ class Fish3DKeypointVerifier:
         """
         初始化或从已有右图 JSON 中加载每条鱼的关键点 group_id 状态和整鱼抛弃状态。
 
-        若右图 JSON 存在：
-          - 从中读取各关键点的 group_id
-          - 若左图中某条鱼在右图 JSON 中没有对应 bbox，推断为被抛弃，设 right_fish_abandoned=True
-        若右图 JSON 不存在：全部初始化为默认值（group_id=None，abandoned=False）
+        状态判断规则（以 bbox description 为权威信号，避免 group_id=0 歧义）：
+          - bbox description 含 "deleted by Delete Right"  → right_fish_abandoned=True
+          - bbox description 含 "fish out of frame"        → right_fish_out_group_id=bbox.group_id
+          - 其他（正常鱼）                                  → 逐点保留各关键点 group_id
+          - 鱼完全不在右图 JSON 中（旧格式兼容）           → right_fish_abandoned=True
         """
         self.right_kp_group_ids = {}
         self.right_fish_abandoned = {}
+        self.right_fish_out_group_id = {}
 
         right_json_path = os.path.join(
             os.path.dirname(self.depth_root), 'annotations', 'labelme', 'right', f"{base_name}.json"
@@ -577,29 +584,52 @@ class Fish3DKeypointVerifier:
                 with open(right_json_path, 'r', encoding='utf-8') as f:
                     right_data = json.load(f)
 
-                # 解析右图 JSON 中出现的所有 fish_id（按 bbox 顺序编号）
-                fish_count = 0
-                current_fish_id = None
+                shapes = right_data.get('shapes', [])
                 right_fish_ids_in_json = set()
 
-                for shape in right_data.get('shapes', []):
-                    gid = shape.get('group_id')
-                    if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish' and gid == 0:
+                # ── 第一遍：收集 bbox 信息（用于状态判断）和关键点 group_id
+                fish_count = 0
+                current_fish_id = None
+                fish_bbox_info = {}  # fish_id -> {group_id, description}
+
+                for shape in shapes:
+                    if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish':
                         fish_count += 1
                         current_fish_id = f"fish_{fish_count}"
                         right_fish_ids_in_json.add(current_fish_id)
                         self.right_kp_group_ids[current_fish_id] = {}
+                        fish_bbox_info[current_fish_id] = {
+                            'group_id': shape.get('group_id'),
+                            'description': shape.get('description', '')
+                        }
                     elif shape['shape_type'] == 'point' and current_fish_id is not None:
-                        kp_name = shape['label']
-                        self.right_kp_group_ids[current_fish_id][kp_name] = gid
+                        self.right_kp_group_ids[current_fish_id][shape['label']] = shape.get('group_id')
 
-                # 推断 right_fish_abandoned：左图中有但右图 JSON 中没有出现的鱼 = 曾被抛弃
+                # ── 第二遍：依据 bbox description 推断每条鱼的整体状态
                 for fish_id in self.fish_keypoints:
-                    if fish_id in right_fish_ids_in_json:
-                        self.right_fish_abandoned[fish_id] = False
-                    else:
+                    if fish_id not in right_fish_ids_in_json:
+                        # 旧格式兼容：鱼不在右图 JSON 中 → 视为已抛弃
                         self.right_fish_abandoned[fish_id] = True
-                        print(f"{fish_id} 未出现在右图JSON中，推断为已抛弃（Delete Right）")
+                        print(f"{fish_id} 未出现在右图JSON中（旧格式），推断为已抛弃")
+                        continue
+
+                    bbox_desc = fish_bbox_info.get(fish_id, {}).get('description', '')
+                    bbox_gid  = fish_bbox_info.get(fish_id, {}).get('group_id')
+
+                    if 'deleted by Delete Right' in bbox_desc:
+                        # 用户手动 Delete Right
+                        self.right_fish_abandoned[fish_id] = True
+                        print(f"{fish_id} bbox description='deleted by Delete Right'，识别为 Delete Right 状态")
+
+                    elif 'fish out of frame' in bbox_desc:
+                        # 用户手动 Fish Out（整鱼出画）
+                        self.right_fish_out_group_id[fish_id] = bbox_gid
+                        self.right_fish_abandoned[fish_id] = False
+                        print(f"{fish_id} bbox description='fish out of frame'，识别为 Fish Out，group_id={bbox_gid}")
+
+                    else:
+                        # 正常鱼：逐点 group_id 已在第一遍收集完毕，直接使用
+                        self.right_fish_abandoned[fish_id] = False
 
                 print(f"从右图JSON加载 group_id 状态: {right_json_path}")
             except Exception as e:
@@ -612,6 +642,7 @@ class Fish3DKeypointVerifier:
         """将所有鱼的所有关键点 group_id 初始化为 None（可见），right_fish_abandoned 全部初始化为 False"""
         self.right_kp_group_ids = {}
         self.right_fish_abandoned = {}
+        self.right_fish_out_group_id = {}
         for fish_id, kps in self.fish_keypoints.items():
             self.right_kp_group_ids[fish_id] = {kp_name: None for kp_name in kps}
             self.right_fish_abandoned[fish_id] = False
@@ -851,14 +882,11 @@ class Fish3DKeypointVerifier:
         """
         调整当前关键点的深度值。
         同步模式下会同时调整当前鱼的所有关键点。
-        若调整后有任意关键点深度 > 0，自动清除该鱼的右图抛弃标记。
         """
         if self.updating_slider or not self.keypoint_names:
             return
 
         current_kp_name = self.keypoint_names[self.current_kp_idx]
-        current_fish_name = self.fish_names[self.current_fish_idx] if self.fish_names else None
-
         if self.sync_depth_mode:
             # 同步模式：计算深度变化量并应用到所有关键点
             delta = float(val) - self.last_depth_value
@@ -873,13 +901,6 @@ class Fish3DKeypointVerifier:
             # 单点模式：只调整当前关键点
             print(f"调整关键点 {current_kp_name} 的深度值为: {val}")
             self.keypoints[current_kp_name][2] = float(val)
-
-        # 若当前鱼有任意关键点深度 > 0，自动解除右图抛弃标记
-        if current_fish_name and self.right_fish_abandoned.get(current_fish_name, False):
-            has_valid = any(kp[2] > 0 for kp in self.keypoints.values())
-            if has_valid:
-                self.right_fish_abandoned.pop(current_fish_name, None)
-                print(f"鱼类 '{current_fish_name}' 右图抛弃标记已解除（检测到有效深度）")
 
         # 更新点云过滤范围以适应新的深度值
         self._filter_point_cloud()
@@ -1258,9 +1279,14 @@ class Fish3DKeypointVerifier:
 
         print(f"已将鱼类 '{current_fish_name}' 的 {reset_count} 个关键点深度重置为0mm")
 
-        # 标记该鱼在右图中被抛弃，不再参与右图 JSON 构建
+        # 标记该鱼在右图中被抛弃，不再参与正常右图 JSON 构建
         self.right_fish_abandoned[current_fish_name] = True
-        print(f"鱼类 '{current_fish_name}' 已标记为右图抛弃（Delete Right）；拖动 Depth 滑块赋值可解除")
+        # 同时将该鱼所有点显式标记为 group_id=0，便于后续做点级恢复（Visible/Absent/Out）
+        if current_fish_name not in self.right_kp_group_ids:
+            self.right_kp_group_ids[current_fish_name] = {}
+        for kp_name in self.keypoints.keys():
+            self.right_kp_group_ids[current_fish_name][kp_name] = 0
+        print(f"鱼类 '{current_fish_name}' 已标记为右图抛弃（Delete Right）")
 
         # 更新点云过滤范围
         self._filter_point_cloud()
@@ -1303,10 +1329,13 @@ class Fish3DKeypointVerifier:
             'toggle_labels':{'rect': [0.30, 0.10, 0.10, 0.03], 'label': 'Labels: ON'},
             'sync_fish':    {'rect': [0.41, 0.10, 0.10, 0.03], 'label': 'Sync: OFF'},
             'drag_mode':    {'rect': [0.52, 0.10, 0.10, 0.03], 'label': 'Drag: Single'},
+            'toggle_bbox':  {'rect': [0.63, 0.10, 0.10, 0.03], 'label': 'BBox: ON'},
 
-            # 第4行 (y=0.22): 右图关键点 group_id 调整（v=可见, a=不存在）
+            # 第4行 (y=0.14): 右图关键点 group_id 调整（v=可见, a=不存在, o=出画）
             'right_kp_visible': {'rect': [0.08, 0.14, 0.14, 0.03], 'label': 'Right KP: Visible [v]'},
             'right_kp_absent':  {'rect': [0.23, 0.14, 0.14, 0.03], 'label': 'Right KP: Absent [a]'},
+            'fish_out':         {'rect': [0.38, 0.14, 0.10, 0.03], 'label': 'Point Out [o]'},
+            'all_kp_visible':   {'rect': [0.49, 0.14, 0.14, 0.03], 'label': 'All Visible [V]'},
         }
         
         # 创建按钮并连接事件
@@ -1341,6 +1370,8 @@ class Fish3DKeypointVerifier:
                 btn.on_clicked(self.visualize_global_3d)
             elif name == 'toggle_labels':
                 btn.on_clicked(self.toggle_labels)
+            elif name == 'toggle_bbox':
+                btn.on_clicked(self.toggle_bboxes)
             elif name == 'sync_fish':
                 btn.on_clicked(self.toggle_sync_mode)
             elif name == 'drag_mode':
@@ -1349,6 +1380,10 @@ class Fish3DKeypointVerifier:
                 btn.on_clicked(self.set_right_kp_visible)
             elif name == 'right_kp_absent':
                 btn.on_clicked(self.set_right_kp_absent)
+            elif name == 'fish_out':
+                btn.on_clicked(self.set_fish_out)
+            elif name == 'all_kp_visible':
+                btn.on_clicked(self.set_all_kp_visible)
             # elif name == 'gui_3d':
             #     btn.on_clicked(self.start_gui_3d_windows)
 
@@ -1457,6 +1492,53 @@ class Fish3DKeypointVerifier:
 
                 # 当前鱼的 fish_id（用于查询右图 group_id，提出循环外避免重复计算）
                 cur_fish_id_for_loop = self.fish_names[self.current_fish_idx] if self.fish_names else None
+                current_fish_kps = self.fish_keypoints.get(cur_fish_id_for_loop, {}) if cur_fish_id_for_loop else {}
+
+                # 绘制当前鱼的左右视图矩形框（可开关）
+                if self.show_bboxes and cur_fish_id_for_loop:
+                    left_bbox = self._get_fish_left_bbox(cur_fish_id_for_loop)
+                    if left_bbox is not None:
+                        lx1, ly1, lx2, ly2 = left_bbox
+                        self.ax_left.add_patch(
+                            Rectangle(
+                                (lx1, ly1),
+                                max(1.0, lx2 - lx1),
+                                max(1.0, ly2 - ly1),
+                                fill=False,
+                                edgecolor='lime',
+                                linewidth=1.8,
+                                linestyle='-'
+                            )
+                        )
+
+                        fish_gid_map = self.right_kp_group_ids.get(cur_fish_id_for_loop, {})
+                        fish_is_abandoned = self.right_fish_abandoned.get(cur_fish_id_for_loop, False)
+                        valid_depths = []
+                        for kp_name, kp in current_fish_kps.items():
+                            # abandoned 状态下未显式设置的点默认为 0（Delete），不纳入框深度
+                            default_gid = 0 if fish_is_abandoned else None
+                            kp_gid = fish_gid_map.get(kp_name, default_gid)
+                            kp_depth = float(kp[2])
+                            # 矩形框深度估计时排除 PointOut(group_id=0)
+                            if kp_gid != 0 and kp_depth > 0:
+                                valid_depths.append(kp_depth)
+                        if valid_depths:
+                            avg_d = float(np.mean(valid_depths))
+                            rx1, ry1, rx2, ry2 = project_bbox_left_to_right(lx1, ly1, lx2, ly2, avg_d, fx, baseline)
+                        else:
+                            rx1, ry1, rx2, ry2 = lx1, ly1, lx2, ly2
+
+                        self.ax_right.add_patch(
+                            Rectangle(
+                                (rx1, ry1),
+                                max(1.0, rx2 - rx1),
+                                max(1.0, ry2 - ry1),
+                                fill=False,
+                                edgecolor='lime',
+                                linewidth=1.8,
+                                linestyle='-'
+                            )
+                        )
 
                 for i, (name, kp) in enumerate(self.keypoints.items()):
                     is_current = (i == self.current_kp_idx)
@@ -1468,7 +1550,10 @@ class Fish3DKeypointVerifier:
                     x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
 
                     # 获取该关键点在右图的 group_id
-                    right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(name, None) if cur_fish_id_for_loop else None
+                    # abandoned 状态下未显式设置的点默认为 0（不可见）
+                    _fish_abandoned = self.right_fish_abandoned.get(cur_fish_id_for_loop, False)
+                    _default_gid = 0 if _fish_abandoned else None
+                    right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(name, _default_gid) if cur_fish_id_for_loop else None
 
                     # 左图：仅表示关键点本身（与右图是否 Absent 无关）
                     if not is_valid_name:
@@ -1524,7 +1609,7 @@ class Fish3DKeypointVerifier:
                                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
                                 )
                         elif right_gid == 1:
-                            # 关键点不存在：画灰色 × 叉号
+                            # 关键点不存在（Absent）：灰色 ×
                             self.ax_right.plot(
                                 x_right,
                                 y_right,
@@ -1537,8 +1622,28 @@ class Fish3DKeypointVerifier:
                                 self.ax_right.text(
                                     x_right + 10,
                                     y_right + 10,
-                                    f"{name} [X]",
+                                    f"{name} [1]",
                                     color="gray",
+                                    fontsize=9,
+                                    weight="bold",
+                                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
+                                )
+                        elif right_gid == 0:
+                            # 不可见（Delete/PointOut）：橙色 ×
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="orange",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=1.8,
+                            )
+                            if self.show_labels:
+                                self.ax_right.text(
+                                    x_right + 10,
+                                    y_right + 10,
+                                    f"{name} [Out/Delete]",
+                                    color="orange",
                                     fontsize=9,
                                     weight="bold",
                                     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7),
@@ -1577,8 +1682,8 @@ class Fish3DKeypointVerifier:
                     x_left, y_left, depth = current_kp[0], current_kp[1], current_kp[2]
                     x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
 
-                    # 获取当前关键点右图 group_id（复用 cur_fish_id_for_loop）
-                    cur_right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(current_kp_name, None) if cur_fish_id_for_loop else None
+                    # 获取当前关键点右图 group_id（abandoned 下未设置的点默认为 0）
+                    cur_right_gid = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(current_kp_name, _default_gid) if cur_fish_id_for_loop else None
 
                     cur_is_valid = current_kp_name in ALLOWED_KEYPOINTS
                     # 左图高亮
@@ -1614,7 +1719,17 @@ class Fish3DKeypointVerifier:
                                 markeredgewidth=2.2,
                             )
                         elif cur_right_gid == 1:
-                            # 不存在：高亮叉号（橙色）
+                            # Absent：高亮叉号（灰色，加粗边框）
+                            self.ax_right.plot(
+                                x_right,
+                                y_right,
+                                "x",
+                                color="gray",
+                                markersize=KP_CROSS_MARKERSIZE,
+                                markeredgewidth=2.2,
+                            )
+                        elif cur_right_gid == 0:
+                            # 不可见（Delete/PointOut）：高亮叉号（橙色，加粗边框）
                             self.ax_right.plot(
                                 x_right,
                                 y_right,
@@ -1641,9 +1756,21 @@ class Fish3DKeypointVerifier:
                 current_kp_name = self.keypoint_names[self.current_kp_idx] if self.keypoint_names else "未知"
                 current_depth = self.keypoints[current_kp_name][2] if self.keypoint_names else 0
 
-                # 获取当前关键点右图状态标签（复用 cur_fish_id_for_loop，避免重复计算）
-                cur_right_gid_title = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}).get(current_kp_name, None) if cur_fish_id_for_loop else None
-                right_kp_status = "Absent[1]" if cur_right_gid_title == 1 else "Visible[null]"
+                # 获取当前关键点右图状态标签（区分“显式设置为None”与“未设置”）
+                right_state_map = self.right_kp_group_ids.get(cur_fish_id_for_loop, {}) if cur_fish_id_for_loop else {}
+                has_point_state = current_kp_name in right_state_map
+                cur_right_gid_title = right_state_map.get(current_kp_name, None)
+                fish_abandoned = self.right_fish_abandoned.get(cur_fish_id_for_loop, False)
+                if cur_right_gid_title == 0:
+                    right_kp_status = "Out/Delete[0]"
+                elif cur_right_gid_title == 1:
+                    right_kp_status = "Absent[1]"
+                elif has_point_state and cur_right_gid_title is None:
+                    right_kp_status = "Visible[null]"
+                elif fish_abandoned:
+                    right_kp_status = "Out/Delete[0]"
+                else:
+                    right_kp_status = "Visible[null]"
 
                 # 计算当前关键点的视差
                 disparity = (fx * baseline) / current_depth if current_depth > 0 else 0
@@ -1726,6 +1853,40 @@ class Fish3DKeypointVerifier:
             btn.label.set_text('Labels: ON' if self.show_labels else 'Labels: OFF')
         self.update_display()
 
+    def toggle_bboxes(self, event=None):
+        """切换矩形框显示状态"""
+        self.show_bboxes = not self.show_bboxes
+        btn = self.buttons.get('toggle_bbox')
+        if btn:
+            btn.label.set_text('BBox: ON' if self.show_bboxes else 'BBox: OFF')
+        self.update_display()
+
+    def _get_fish_left_bbox(self, fish_id: str):
+        """
+        按 fish 序号从左图 annotation_data 中获取对应 fish bbox。
+
+        Args:
+            - fish_id (str): 鱼ID，格式如 fish_1
+
+        Returns:
+            - (tuple | None): (x1, y1, x2, y2)；不存在时返回None
+        """
+        if not self.annotation_data or 'shapes' not in self.annotation_data:
+            return None
+
+        fish_count = 0
+        for shape in self.annotation_data['shapes']:
+            if shape.get('shape_type') == 'rectangle' and shape.get('label') == 'fish':
+                fish_count += 1
+                if fish_id == f"fish_{fish_count}":
+                    pts = shape.get('points', [])
+                    if not pts:
+                        return None
+                    xs = [float(p[0]) for p in pts]
+                    ys = [float(p[1]) for p in pts]
+                    return min(xs), min(ys), max(xs), max(ys)
+        return None
+
     def toggle_sync_mode(self, event=None):
         """切换同步深度调整模式"""
         self.sync_depth_mode = not self.sync_depth_mode
@@ -1774,6 +1935,60 @@ class Fish3DKeypointVerifier:
             self.right_kp_group_ids[current_fish] = {}
         self.right_kp_group_ids[current_fish][current_kp] = 1
         print(f"右图关键点 [{current_fish}] '{current_kp}' 设置为不存在 (group_id=1)")
+        self.update_display()
+
+    def set_fish_out(self, event=None):
+        """
+        Point Out：仅对当前选中的关键点操作。
+          - 该关键点深度清零
+          - 右图 group_id 设为 0（表示该点不在画面中）
+        """
+        if not self.fish_names or self.current_fish_idx < 0:
+            return
+        if not self.keypoint_names or self.current_kp_idx >= len(self.keypoint_names):
+            return
+
+        current_fish = self.fish_names[self.current_fish_idx]
+        current_kp = self.keypoint_names[self.current_kp_idx]
+
+        # 当前关键点深度清零
+        if current_kp in self.keypoints:
+            self.keypoints[current_kp][2] = 0.0
+        if current_fish in self.fish_keypoints and current_kp in self.fish_keypoints[current_fish]:
+            self.fish_keypoints[current_fish][current_kp][2] = 0.0
+
+        # 加入 reset_keypoints，保存时写入 "reset - invalid depth" 标记，防止重启后被深度图恢复
+        if current_fish not in self.reset_keypoints:
+            self.reset_keypoints[current_fish] = set()
+        self.reset_keypoints[current_fish].add(current_kp)
+
+        # 右图该点 group_id 设为 0
+        if current_fish not in self.right_kp_group_ids:
+            self.right_kp_group_ids[current_fish] = {}
+        self.right_kp_group_ids[current_fish][current_kp] = 0
+
+        print(f"关键点 [{current_fish}] '{current_kp}' 已标记为 Point Out，depth=0，right group_id=0")
+        self.update_display()
+
+    def set_all_kp_visible(self, event=None):
+        """
+        将当前鱼的所有关键点在右图中设置为可见（group_id=None），
+        并清除整鱼 Delete Right 抛弃标记。
+        """
+        if not self.fish_names or self.current_fish_idx < 0:
+            return
+
+        current_fish = self.fish_names[self.current_fish_idx]
+
+        if current_fish not in self.right_kp_group_ids:
+            self.right_kp_group_ids[current_fish] = {}
+        for kp_name in self.keypoint_names:
+            self.right_kp_group_ids[current_fish][kp_name] = None
+
+        # 清除整鱼 abandoned 标记
+        self.right_fish_abandoned.pop(current_fish, None)
+
+        print(f"鱼类 '{current_fish}' 所有关键点已设置为可见 (group_id=null)，Delete Right 标记已清除")
         self.update_display()
 
     def _get_stereo_params(self):
@@ -1885,12 +2100,18 @@ class Fish3DKeypointVerifier:
         """
         键盘快捷键处理
         v: 将当前右图关键点设置为可见（group_id=null）
+        V: 将当前鱼所有关键点设置为可见（group_id=null），并清除 Delete Right 标记
         a: 将当前右图关键点设置为不存在（group_id=1）
+        o: 将当前整条鱼标记为出画（弹出 group_id 选择框）
         """
         if event.key == 'v':
             self.set_right_kp_visible()
+        elif event.key == 'V':
+            self.set_all_kp_visible()
         elif event.key == 'a':
             self.set_right_kp_absent()
+        elif event.key == 'o':
+            self.set_fish_out()
 
     def visualize_3d(self, event=None):
         """
@@ -2461,8 +2682,9 @@ class Fish3DKeypointVerifier:
         为当前帧的所有鱼生成右图 labelme JSON 数据。
 
         过滤规则（同时满足才写入右图）：
-        1. 整鱼抛弃：right_fish_abandoned[fish_id]==True → 跳过整条鱼
-        2. 单点过滤：depth==0 或 x_right 不在 [OVERLAP_X_MIN, OVERLAP_X_MAX] → 跳过该点
+        1. 整鱼抛弃：right_fish_abandoned[fish_id]==True → 显式写入 group_id=0
+        2. 单点过滤：depth==0 且 right_kp_group_ids 无显式设置 → 跳过该点；
+                    若用户已显式设置 group_id（0/1），则用左图坐标占位写入，保留状态
         3. 整鱼自动跳过：一条鱼所有关键点都被过滤 → 连 bbox 也不建立
         4. imagePath 仅写文件名，labelme 在 JSON 同目录下查找图片
 
@@ -2481,83 +2703,188 @@ class Fish3DKeypointVerifier:
 
         right_shapes = []
 
+        def _bbox_minmax(points):
+            """
+            兼容2点/4点矩形标注，统一提取(minx, miny, maxx, maxy)。
+            """
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            return min(xs), min(ys), max(xs), max(ys)
+
         # 第一步：建立 fish_id -> bbox shape 映射
         fish_bbox_map = {}
         fish_count = 0
         for shape in self.annotation_data['shapes']:
-            if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish' and shape.get('group_id') == 0:
+            # 兼容 left JSON 中 fish bbox 的 group_id 为 null/0 等情况
+            if shape['shape_type'] == 'rectangle' and shape['label'] == 'fish':
                 fish_count += 1
                 fish_bbox_map[f"fish_{fish_count}"] = shape
 
         # 第二步：遍历每条鱼
         for fish_id, kps in self.fish_keypoints.items():
 
-            # 规则1：用户手动抛弃 → 整条跳过
+            bbox_shape = fish_bbox_map.get(fish_id)
+
+            # ── 规则A：用户手动 Delete Right → 显式写入 group_id=0（不再 omit）
             if self.right_fish_abandoned.get(fish_id, False):
-                print(f"跳过 {fish_id}（用户手动 Delete Right）")
+                print(f"{fish_id}（Delete Right）→ 显式写入右图JSON，group_id=0")
+                # 只要有任意点被手动改为非0状态（Visible=None / Absent=1），
+                # 就不再把整鱼 bbox 标记为 "deleted by Delete Right"。
+                point_gid_overrides = self.right_kp_group_ids.get(fish_id, {})
+                has_non_deleted_point = any(point_gid_overrides.get(kp_name, 0) != 0 for kp_name in kps.keys())
+                bbox_desc = "" if has_non_deleted_point else "deleted by Delete Right"
+
+                # 构建 bbox（有深度则投影，无则用左图坐标）
+                if bbox_shape is not None:
+                    pts = bbox_shape['points']
+                    lx1, ly1, lx2, ly2 = _bbox_minmax(pts)
+                    # Delete Right 状态下，优先用“非删除点(group_id!=0)”估计bbox深度，避免被大量0组点拉飞
+                    valid_depths = []
+                    for kp_name, kp in kps.items():
+                        kp_gid = point_gid_overrides.get(kp_name, 0)
+                        kp_depth = float(kp[2])
+                        if kp_gid != 0 and kp_depth > 0:
+                            valid_depths.append(kp_depth)
+                    if valid_depths:
+                        avg_d = float(np.mean(valid_depths))
+                        rx1, ry1, rx2, ry2 = project_bbox_left_to_right(lx1, ly1, lx2, ly2, avg_d, fx, baseline)
+                    else:
+                        # 无可用于估计的非删除点时，保留左图框位置，避免被 out 点深度拉飞
+                        rx1, ry1, rx2, ry2 = lx1, ly1, lx2, ly2
+                    right_shapes.append({
+                        "label": "fish", "points": [[rx1, ry1], [rx2, ry2]],
+                        "group_id": 0, "description": bbox_desc,
+                        "shape_type": "rectangle", "flags": {}
+                    })
+                else:
+                    # 兜底：若未找到左图 bbox，也根据关键点生成一个右图框（至少有一个点就有框）
+                    projected_pts = []
+                    for kp in kps.values():
+                        x_left, y_left, depth = float(kp[0]), float(kp[1]), float(kp[2])
+                        if depth > 0:
+                            x_r, y_r = project_left_to_right(x_left, y_left, depth, fx, baseline)
+                        else:
+                            x_r, y_r = x_left, y_left
+                        projected_pts.append((x_r, y_r))
+                    if projected_pts:
+                        xs = [p[0] for p in projected_pts]
+                        ys = [p[1] for p in projected_pts]
+                        pad = 8.0
+                        rx1, ry1 = min(xs) - pad, min(ys) - pad
+                        rx2, ry2 = max(xs) + pad, max(ys) + pad
+                        right_shapes.append({
+                            "label": "fish", "points": [[rx1, ry1], [rx2, ry2]],
+                            "group_id": 0, "description": bbox_desc,
+                            "shape_type": "rectangle", "flags": {}
+                        })
+                # 写所有关键点：默认 deleted(0)，但允许点级状态覆盖（Visible/Absent/Out）
+                for kp_name, kp in kps.items():
+                    x_left, y_left, depth = float(kp[0]), float(kp[1]), float(kp[2])
+                    if depth > 0:
+                        x_r, y_r = project_left_to_right(x_left, y_left, depth, fx, baseline)
+                    else:
+                        x_r, y_r = x_left, y_left
+                    kp_gid = point_gid_overrides.get(kp_name, 0)
+                    kp_desc = f"depth: {depth:.2f}mm"
+                    right_shapes.append({
+                        "label": kp_name, "points": [[x_r, y_r]],
+                        "group_id": kp_gid, "description": kp_desc,
+                        "shape_type": "point", "flags": {}
+                    })
+                continue
+
+            # ── 规则B：用户手动"出画"→ 显式写入自定义 group_id
+            out_gid = self.right_fish_out_group_id.get(fish_id)
+            if out_gid is not None:
+                print(f"{fish_id}（Fish Out）→ 显式写入右图JSON，group_id={out_gid}")
+                if bbox_shape is not None:
+                    pts = bbox_shape['points']
+                    lx1, ly1, lx2, ly2 = _bbox_minmax(pts)
+                    valid_depths = [float(kp[2]) for kp in kps.values() if float(kp[2]) > 0]
+                    if valid_depths:
+                        avg_d = float(np.mean(valid_depths))
+                        rx1, ry1, rx2, ry2 = project_bbox_left_to_right(lx1, ly1, lx2, ly2, avg_d, fx, baseline)
+                    else:
+                        rx1, ry1, rx2, ry2 = lx1, ly1, lx2, ly2
+                    right_shapes.append({
+                        "label": "fish", "points": [[rx1, ry1], [rx2, ry2]],
+                        "group_id": out_gid, "description": f"fish out of frame, group_id={out_gid}",
+                        "shape_type": "rectangle", "flags": {}
+                    })
+                for kp_name, kp in kps.items():
+                    x_left, y_left, depth = float(kp[0]), float(kp[1]), float(kp[2])
+                    if depth > 0:
+                        x_r, y_r = project_left_to_right(x_left, y_left, depth, fx, baseline)
+                    else:
+                        x_r, y_r = x_left, y_left
+                    right_shapes.append({
+                        "label": kp_name, "points": [[x_r, y_r]],
+                        "group_id": out_gid, "description": f"depth: {depth:.2f}mm",
+                        "shape_type": "point", "flags": {}
+                    })
                 continue
 
             fish_right_gids = self.right_kp_group_ids.get(fish_id, {})
 
-            # 规则2+3：逐点过滤，收集有效关键点
+            # ── 规则C：逐点处理，depth==0 跳过；SGBM 筛除 → group_id=0；有效 → 正常写入
             valid_kp_shapes = []
             for kp_name, kp in kps.items():
                 x_left, y_left, depth = float(kp[0]), float(kp[1]), float(kp[2])
 
-                # depth==0 → 跳过（SGBM 无法计算视差 或 用户 Reset）
+                # depth==0 → 若用户已显式设置 group_id，仍写入（用左图坐标占位）；否则跳过
                 if depth <= 0:
-                    print(f"  跳过 {fish_id}/{kp_name}：depth={depth:.1f}mm")
+                    right_gid_explicit = fish_right_gids.get(kp_name)
+                    if right_gid_explicit is not None:
+                        print(f"  {fish_id}/{kp_name}：depth=0 但用户已设置 group_id={right_gid_explicit}，写入占位")
+                        valid_kp_shapes.append({
+                            "label": kp_name, "points": [[x_left, y_left]],
+                            "group_id": right_gid_explicit,
+                            "description": "depth: 0.00mm",
+                            "shape_type": "point", "flags": {}
+                        })
+                    else:
+                        print(f"  跳过 {fish_id}/{kp_name}：depth={depth:.1f}mm")
                     continue
 
                 x_right, y_right = project_left_to_right(x_left, y_left, depth, fx, baseline)
 
-                # 不在双目重叠区域 → 跳过
-                if x_right < self.OVERLAP_X_MIN or x_right > self.OVERLAP_X_MAX:
-                    print(f"  跳过 {fish_id}/{kp_name}：x_right={x_right:.1f} 不在重叠区域 [{self.OVERLAP_X_MIN}, {self.OVERLAP_X_MAX}]")
-                    continue
-
                 right_gid = fish_right_gids.get(kp_name, None)
-
-                # 从左图 shapes 中找对应 description
-                description = ''
-                for s in self.annotation_data['shapes']:
-                    if (s['shape_type'] == 'point' and s['label'] == kp_name
-                            and s.get('group_id') is None):
-                        sp = s['points'][0]
-                        if abs(sp[0] - x_left) < 1.0 and abs(sp[1] - y_left) < 1.0:
-                            description = s.get('description', '')
-                            break
+                description = f"depth: {depth:.2f}mm"
 
                 valid_kp_shapes.append({
-                    "label": kp_name,
-                    "points": [[x_right, y_right]],
-                    "group_id": right_gid,
-                    "description": description,
-                    "shape_type": "point",
-                    "flags": {}
+                    "label": kp_name, "points": [[x_right, y_right]],
+                    "group_id": right_gid, "description": description,
+                    "shape_type": "point", "flags": {}
                 })
 
-            # 规则3：无有效关键点 → 整条鱼（含 bbox）跳过
+            # 规则C3：无任何关键点（全部 depth==0）→ 整条鱼跳过
             if not valid_kp_shapes:
-                print(f"跳过 {fish_id}：所有关键点均在重叠区域外或 depth==0")
+                print(f"跳过 {fish_id}：所有关键点 depth==0")
                 continue
 
-            # 构建 bbox（用有效关键点的平均深度投影）
-            bbox_shape = fish_bbox_map.get(fish_id)
+            # 构建 bbox：仅使用非 PointOut(group_id!=0) 且 depth>0 的点估计深度
+            valid_depths = []
+            for kp_name, kp in kps.items():
+                kp_gid = fish_right_gids.get(kp_name, None)
+                kp_depth = float(kp[2])
+                if kp_gid != 0 and kp_depth > 0:
+                    valid_depths.append(kp_depth)
+
             if bbox_shape is not None:
                 pts = bbox_shape['points']
-                lx1, ly1 = pts[0][0], pts[0][1]
-                lx2, ly2 = pts[1][0], pts[1][1]
-                valid_depths = [kp[2] for kp in kps.values() if kp[2] > 0]
-                avg_depth = float(np.mean(valid_depths))
-                rx1, ry1, rx2, ry2 = project_bbox_left_to_right(lx1, ly1, lx2, ly2, avg_depth, fx, baseline)
+                lx1, ly1, lx2, ly2 = _bbox_minmax(pts)
+                if valid_depths:
+                    avg_depth = float(np.mean(valid_depths))
+                    rx1, ry1, rx2, ry2 = project_bbox_left_to_right(lx1, ly1, lx2, ly2, avg_depth, fx, baseline)
+                    bbox_desc = f"projected from left, avg_depth: {avg_depth:.1f}mm"
+                else:
+                    rx1, ry1, rx2, ry2 = lx1, ly1, lx2, ly2
+                    bbox_desc = "projected from left (no non-out depth)"
                 right_shapes.append({
-                    "label": "fish",
-                    "points": [[rx1, ry1], [rx2, ry2]],
+                    "label": "fish", "points": [[rx1, ry1], [rx2, ry2]],
                     "group_id": 0,
-                    "description": f"projected from left, avg_depth: {avg_depth:.1f}mm",
-                    "shape_type": "rectangle",
-                    "flags": {}
+                    "description": bbox_desc,
+                    "shape_type": "rectangle", "flags": {}
                 })
 
             right_shapes.extend(valid_kp_shapes)
@@ -2625,7 +2952,13 @@ class Fish3DKeypointVerifier:
                         # 更新所有鱼（不过滤 current_fish_name）
                         if fish_name in self.fish_keypoints and kp_name in self.fish_keypoints[fish_name]:
                             depth_value = self.fish_keypoints[fish_name][kp_name][2]
-                            shape['description'] = f"depth: {depth_value:.2f}mm"
+                            # 若该点在 reset_keypoints 中且深度为0，保留 reset 标记，防止重新加载时被深度图覆盖
+                            is_reset = (fish_name in self.reset_keypoints
+                                        and kp_name in self.reset_keypoints.get(fish_name, set()))
+                            if is_reset and depth_value == 0.0:
+                                shape['description'] = "depth: 0.00mm (reset - invalid depth)"
+                            else:
+                                shape['description'] = f"depth: {depth_value:.2f}mm"
                             updated_count += 1
                         else:
                             print(f"警告: 找不到 {fish_name} 中关键点 {kp_name} 的深度数据")
@@ -3206,6 +3539,7 @@ def run_gui_visualization_worker(args):
 
 
 if __name__ == "__main__":
+    mp.freeze_support()  # PyInstaller Windows multiprocessing 必须调用
     print("hello world")
     success = main()
     sys.exit(0 if success else 1)
